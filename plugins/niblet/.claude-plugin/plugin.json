@@ -1,0 +1,22 @@
+{
+  "name": "niblet",
+  "displayName": "Niblet",
+  "version": "0.1.0",
+  "description": "The diligent crumb-keeper for AI coding sessions. After every subtask, Niblet quietly writes findings to the project knowledge base; at session end a sub-agent extracts reusable workflow patterns into skills. Hook-driven, per-project, with auto-gitignore.",
+  "author": {
+    "name": "madlexa"
+  },
+  "repository": "https://github.com/madlexa/skills",
+  "homepage": "https://github.com/madlexa/skills/tree/main/plugins/niblet",
+  "license": "MIT",
+  "keywords": [
+    "knowledge",
+    "memory",
+    "session",
+    "scribe",
+    "kb",
+    "skills",
+    "compounding",
+    "auto-learning"
+  ]
+}

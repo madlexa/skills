@@ -1,0 +1,19 @@
+{
+  "name": "madlexa-skills",
+  "owner": {
+    "name": "madlexa"
+  },
+  "description": "Plugins and skills for AI coding agents (Claude Code, Kimi Code).",
+  "plugins": [
+    {
+      "name": "niblet",
+      "source": "./plugins/niblet",
+      "description": "The diligent crumb-keeper for AI coding sessions. Niblet quietly notes every discovery, gotcha, and workflow pattern from each session and saves them as durable project artifacts (KB entries, skills, commands, memory) so the next session compounds on the last.",
+      "version": "0.1.0",
+      "keywords": ["knowledge", "memory", "session", "scribe", "kb", "skills", "compounding"],
+      "author": {
+        "name": "madlexa"
+      }
+    }
+  ]
+}
