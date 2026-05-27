@@ -1,12 +1,20 @@
 #!/usr/bin/env bash
 # on_session_end.sh — fires on SessionEnd (session terminates).
 #
-# Touches PENDING_DEEP for THIS session. The user's next session in this
-# project will see the marker (via on_prompt_submit.sh) and trigger a
-# sub-agent pass that processes the just-finished session's raw log.
+# Writes a project-wide queue file so the NEXT session in this project picks
+# up the DEEP checkpoint regardless of session_id. Per-session markers are
+# unreachable across sessions because UserPromptSubmit only sees its own
+# session_id — that bug was the original v0.2 P0 (the marker would be
+# orphaned).
 #
-# This is the natural moment for DEEP work: the user is not waiting,
-# the session is fully observable, and we don't interrupt mid-session UX.
+# Queue file:
+#   <project>/.niblet/pending_deep/<utc-ts>-<ended-session-id>.queue
+#
+# Body (newline-delimited key=value):
+#   session_id=<id>
+#   raw_log=<absolute path to .jsonl>
+#   turns=<count>
+#   ended_at=<utc iso>
 
 set +e
 set +u
@@ -30,9 +38,25 @@ CWD="$(field cwd)";            [ -z "$CWD" ]     && CWD="$PWD"
 SESSION="$(field session_id)"; [ -z "$SESSION" ] && SESSION="unknown"
 
 PROJECT_ROOT="$(niblet_project_root "$CWD")"
-niblet_ensure_store "$PROJECT_ROOT" "$SESSION" >/dev/null
-SESSION_DIR="$(niblet_session_dir "$PROJECT_ROOT" "$SESSION")"
-[ -n "$SESSION_DIR" ] || exit 0
+STORE="$(niblet_ensure_store "$PROJECT_ROOT" "$SESSION")"
+[ -n "$STORE" ] || exit 0
 
-touch "$SESSION_DIR/PENDING_DEEP" 2>/dev/null
+QUEUE_DIR="$STORE/pending_deep"
+mkdir -p "$QUEUE_DIR" 2>/dev/null
+
+TS="$(date -u +%Y%m%dT%H%M%SZ)"
+QUEUE_FILE="$QUEUE_DIR/${TS}-${SESSION}.queue"
+
+# Look up turn count from per-session counter (best effort).
+TURNS=0
+COUNTER_FILE="$STORE/sessions/$SESSION/task_counter"
+[ -f "$COUNTER_FILE" ] && TURNS="$(cat "$COUNTER_FILE" 2>/dev/null || echo 0)"
+
+{
+  echo "session_id=$SESSION"
+  echo "raw_log=$STORE/raw/${SESSION}.jsonl"
+  echo "turns=$TURNS"
+  echo "ended_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} > "$QUEUE_FILE" 2>/dev/null
+
 exit 0

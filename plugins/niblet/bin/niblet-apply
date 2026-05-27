@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# niblet-apply — the single secure entry point for ACTION writes.
+#
+# The parent agent reads ACTION JSON lines from the niblet-deep sub-agent and
+# pipes each line to this script via the Bash tool. The script validates the
+# action and either writes it to its target (auto-write tier) or stages it
+# as a proposal (proposal tier). All filename inputs are slug-validated and
+# all final paths are canonicalised + containment-checked, so a malicious
+# `topic` / `name` / `file` value cannot escape the allowed directory.
+#
+# Usage:
+#   echo '<json>' | niblet-apply --project-root <abs-path>
+#
+# Output:
+#   On success:  "applied: <action> -> <target>"   or
+#                "proposal: <action> -> <proposal-path>"
+#   On any rejection: "rejected: <reason>" (exit non-zero)
+#
+# Never writes outside the project's .claude/ or .niblet/proposals/ tree,
+# or the user's ~/.claude/ or ~/.niblet-proposals/ tree for global scope.
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+. "$SCRIPT_DIR/../lib/paths.sh"
+. "$SCRIPT_DIR/../lib/sanitize.sh"
+. "$SCRIPT_DIR/../lib/gitignore.sh"
+. "$SCRIPT_DIR/../lib/store.sh"
+
+# ---- args ----
+PROJECT_ROOT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --project-root) PROJECT_ROOT="$2"; shift 2 ;;
+    *) printf 'unknown arg: %s\n' "$1" >&2; exit 64 ;;
+  esac
+done
+
+JSON="$(cat)"
+[ -n "$JSON" ] || { echo "rejected: empty input" >&2; exit 64; }
+
+command -v jq >/dev/null 2>&1 || { echo "rejected: jq is required" >&2; exit 70; }
+
+# Auto-detect project root from $PWD if not given.
+[ -n "$PROJECT_ROOT" ] || PROJECT_ROOT="$(niblet_project_root "$PWD")"
+[ -d "$PROJECT_ROOT" ] || { echo "rejected: project_root not a directory: $PROJECT_ROOT" >&2; exit 66; }
+
+ACTION="$(printf '%s' "$JSON" | jq -r '.action // empty')"
+SCOPE="$( printf '%s' "$JSON" | jq -r '.scope  // "project"')"
+NAME="$(  printf '%s' "$JSON" | jq -r '.name   // empty')"
+TOPIC="$( printf '%s' "$JSON" | jq -r '.topic  // empty')"
+FILE="$(  printf '%s' "$JSON" | jq -r '.file   // empty')"
+SECTION="$(printf '%s' "$JSON" | jq -r '.section // empty')"
+ADDITION="$(printf '%s' "$JSON" | jq -r '.addition // empty')"
+CONTENT="$( printf '%s' "$JSON" | jq -r '.content  // empty')"
+REASON="$(  printf '%s' "$JSON" | jq -r '.reason   // empty')"
+
+[ -n "$ACTION" ] || { echo "rejected: no action field" >&2; exit 65; }
+case "$SCOPE" in project|global) ;; *) echo "rejected: scope must be project|global" >&2; exit 65 ;; esac
+
+# Slug-validate the user-supplied name field (action-specific).
+validate_or_proposal() {
+  local what="$1" val="$2"
+  if ! niblet_validate_slug "$val"; then
+    proposal "invalid-slug:$what=$val"
+    return 1
+  fi
+}
+
+# Tally proposals dir creation.
+PROPOSALS_DIR_PROJECT="$(niblet_store "$PROJECT_ROOT")/proposals"
+PROPOSALS_DIR_GLOBAL="$HOME/.niblet-proposals"
+
+niblet_ensure_store "$PROJECT_ROOT" >/dev/null
+
+ts() { date -u +%Y%m%dT%H%M%SZ; }
+
+write_proposal() {
+  local target_dir="$1" reason="$2" target_path="$3"
+  mkdir -p "$target_dir" 2>/dev/null
+  local fname; fname="$(ts)-${ACTION}-$(printf '%s' "$NAME$TOPIC$FILE" | tr -c 'a-zA-Z0-9' '-' | tr -s '-' | sed 's/^-//;s/-$//')"
+  [ -z "$fname" ] && fname="$(ts)-${ACTION}"
+  local proposal_path="$target_dir/${fname}.md"
+  {
+    echo "---"
+    echo "action: $ACTION"
+    echo "scope: $SCOPE"
+    [ -n "$target_path" ] && echo "target: $target_path"
+    [ -n "$reason" ]      && echo "rejected_reason: $reason"
+    echo "created: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    [ -n "$NAME" ]    && echo "name: $NAME"
+    [ -n "$TOPIC" ]   && echo "topic: $TOPIC"
+    [ -n "$FILE" ]    && echo "file: $FILE"
+    [ -n "$SECTION" ] && echo "section: $SECTION"
+    echo "---"
+    if [ "$ACTION" = "UPDATE_CLAUDE" ]; then
+      printf '%s\n' "$ADDITION"
+    else
+      printf '%s\n' "$CONTENT"
+    fi
+  } > "$proposal_path"
+  echo "proposal: $ACTION -> $proposal_path"
+  exit 0
+}
+
+proposal() {
+  local reason="$1"
+  local target_dir="$PROPOSALS_DIR_PROJECT"
+  [ "$SCOPE" = "global" ] && target_dir="$PROPOSALS_DIR_GLOBAL"
+  write_proposal "$target_dir" "$reason" ""
+}
+
+write_auto() {
+  local target_path="$1"
+  mkdir -p "$(dirname "$target_path")" 2>/dev/null
+  printf '%s\n' "$CONTENT" > "$target_path"
+  echo "applied: $ACTION -> $target_path"
+}
+
+# ---- dispatch ----
+case "$ACTION" in
+  NOTHING)
+    echo "applied: NOTHING reason=${REASON:-unspecified}"
+    exit 0
+    ;;
+
+  ADD_KB_ENTRY)
+    [ "$SCOPE" = "project" ] || proposal "global-kb-needs-review"
+    niblet_validate_slug "$TOPIC" || proposal "invalid-slug:topic=$TOPIC"
+    KB="$(niblet_artifact_dir kb project "$PROJECT_ROOT")"
+    target="$KB/$TOPIC"
+    case "$target" in *.md) ;; *) target="$target.md" ;; esac
+    niblet_assert_under_dir "$target" "$KB" 2>/dev/null || proposal "path-escape:topic=$TOPIC"
+    write_auto "$target"
+    ;;
+
+  UPDATE_MEMORY)
+    [ "$SCOPE" = "project" ] || proposal "global-memory-needs-review"
+    niblet_validate_slug "$FILE" || proposal "invalid-slug:file=$FILE"
+    MEM="$(niblet_artifact_dir memory project "$PROJECT_ROOT")"
+    target="$MEM/$FILE"
+    case "$target" in *.md) ;; *) target="$target.md" ;; esac
+    niblet_assert_under_dir "$target" "$MEM" 2>/dev/null || proposal "path-escape:file=$FILE"
+    write_auto "$target"
+    ;;
+
+  CREATE_SKILL|CREATE_COMMAND)
+    niblet_validate_slug "$NAME" || proposal "invalid-slug:name=$NAME"
+    if [ "$ACTION" = "CREATE_SKILL" ]; then
+      base="$(niblet_artifact_dir skills "$SCOPE" "$PROJECT_ROOT")"
+      target="$base/$NAME/SKILL.md"
+    else
+      base="$(niblet_artifact_dir commands "$SCOPE" "$PROJECT_ROOT")"
+      target="$base/$NAME.md"
+    fi
+    niblet_assert_under_dir "$target" "$base" 2>/dev/null || proposal "path-escape:name=$NAME"
+    # Skills/commands/CLAUDE.md/global are PROPOSAL tier — always proposal even when valid.
+    target_dir="$PROPOSALS_DIR_PROJECT"
+    [ "$SCOPE" = "global" ] && target_dir="$PROPOSALS_DIR_GLOBAL"
+    write_proposal "$target_dir" "" "$target"
+    ;;
+
+  UPDATE_CLAUDE)
+    [ "$SCOPE" = "project" ] || proposal "global-claude-md-not-supported"
+    [ -n "$SECTION" ]  || proposal "missing-section"
+    [ -n "$ADDITION" ] || proposal "missing-addition"
+    target="$PROJECT_ROOT/CLAUDE.md"
+    write_proposal "$PROPOSALS_DIR_PROJECT" "" "$target"
+    ;;
+
+  *)
+    echo "rejected: unknown action: $ACTION" >&2
+    exit 65
+    ;;
+esac

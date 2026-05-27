@@ -19,6 +19,10 @@ The parent's prompt names these paths explicitly:
 - **Project commands directory** — already-saved slash commands
 - **Project root** — the codebase the session worked in
 
+The session log captures only **tool name, file path (project-relative), and
+exit code per event**. Raw `tool_input` and `tool_response` content was
+deliberately not stored — you reason from action sequences, not content.
+
 ## Method
 
 1. **Read the raw log.** Identify clusters of tool calls that together
@@ -64,6 +68,13 @@ are encoded as `\n` (standard JSON).
 - `scope: "project"` — pattern depends on this codebase / stack / team. **Default.**
 - `scope: "global"` — pattern is universal across any project
   (git, security, generic terminal idioms). Use sparingly.
+
+### Slug constraints
+
+`name`, `topic`, and `file` are **strict slugs**: 1..64 chars,
+`^[a-z0-9][a-z0-9._-]*$`, no `/`, `\`, or `..`. The parent pipes each
+ACTION through `bin/niblet-apply` which rejects bad slugs as proposals
+with `rejected_reason=invalid-slug`. Emit clean slugs.
 
 ### Content rules
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# sanitize.sh — extract safe metadata from Claude Code hook input.
+# sanitize.sh — extract safe metadata + validate sub-agent-supplied names.
 #
 # Workflow patterns are sequences of (tool, path, success). The PLUGIN MUST
 # NOT store raw tool_input or tool_response content — those can include
@@ -127,4 +127,92 @@ niblet_project_relative_path() {
   esac
 
   echo "$path"
+}
+
+# niblet_validate_slug <candidate>
+#
+# Returns 0 if candidate is a safe single-segment filename / skill name:
+#   - 1..64 chars
+#   - starts with [a-z0-9]
+#   - subsequent chars: [a-z0-9._-]
+#   - no "/", "\", "..", or other path-tricks
+# Returns non-zero otherwise. Prints nothing.
+niblet_validate_slug() {
+  local s="$1"
+  [ -n "$s" ] || return 1
+  # Length sanity
+  [ "${#s}" -le 64 ] || return 1
+  # Whole-string regex match (POSIX bash)
+  case "$s" in
+    .*|*..*) return 1 ;;
+    */*|*\\*) return 1 ;;
+  esac
+  printf '%s' "$s" | LC_ALL=C grep -Eq '^[a-z0-9][a-z0-9._-]{0,63}$'
+}
+
+# niblet_canonical_path <path>
+#
+# Emit a lexically-canonical absolute path: relative → made absolute via $PWD,
+# any "." segments dropped, any ".." segments collapsed. The path is NOT
+# required to exist (so this works for proposed write targets). Tries python3
+# first (handles all edge cases), falls back to a pure-bash collapse.
+niblet_canonical_path() {
+  local p="$1"
+  [ -n "$p" ] || return 0
+
+  if command -v python3 >/dev/null 2>&1; then
+    # realpath() resolves symlinks where the path exists (handles macOS
+    # /var → /private/var) and falls back to lexical normalization for
+    # non-existent trailing segments. This is exactly what containment
+    # checks need: both candidate and root land in the same realm.
+    python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$p" 2>/dev/null && return 0
+  fi
+
+  # Bash-only fallback: make absolute, then collapse . and ..
+  case "$p" in /*) ;; *) p="$PWD/$p" ;; esac
+  local result=""
+  local seg
+  local oldIFS="$IFS"
+  IFS=/
+  # Disable globbing for the split iteration
+  set -o noglob
+  for seg in $p; do
+    case "$seg" in
+      ''|'.') ;;
+      '..')   result="${result%/*}" ;;
+      *)      result="$result/$seg" ;;
+    esac
+  done
+  set +o noglob
+  IFS="$oldIFS"
+  [ -z "$result" ] && result="/"
+  echo "$result"
+}
+
+# niblet_assert_under_dir <candidate_path> <allowed_root>
+#
+# Returns 0 iff the canonicalised candidate path is equal to or under the
+# canonicalised allowed_root. Returns non-zero on any escape (../, symlink,
+# absolute outside, etc.). Prints nothing on success; on failure prints
+# "escape" to stderr.
+niblet_assert_under_dir() {
+  local candidate="$1"
+  local root="$2"
+  [ -n "$candidate" ] || return 1
+  [ -n "$root" ]      || return 1
+
+  local cc cr
+  cc="$(niblet_canonical_path "$candidate")"
+  cr="$(niblet_canonical_path "$root")"
+  [ -n "$cc" ] || return 1
+  [ -n "$cr" ] || return 1
+
+  # Trailing slash to avoid /foo/barX matching /foo/bar
+  case "$cc/" in
+    "$cr/"*) return 0 ;;
+  esac
+  # Equal to root is also acceptable
+  [ "$cc" = "$cr" ] && return 0
+  echo "escape" >&2
+  return 1
 }

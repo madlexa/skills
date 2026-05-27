@@ -25,7 +25,21 @@ reminder appears.
 Why proposals: skills and CLAUDE.md affect every future session and are
 checked into git. Auto-writing them would let any text Claude reads
 (e.g. an attacker's README) become a permanent committed instruction.
-Proposals require a human `mv` to take effect.
+Proposals require a human action to take effect.
+
+### Single write entry point — `bin/niblet-apply`
+
+You do NOT call Edit/Write directly when acting on a NIBLET CHECKPOINT.
+Every action goes through the plugin's secure helper, which validates
+slugs, enforces path containment, and routes to auto-write vs proposal:
+
+```bash
+echo '{"action":"ADD_KB_ENTRY","scope":"project","topic":"auth.md","content":"…"}' \
+  | "${CLAUDE_PLUGIN_ROOT}/bin/niblet-apply" --project-root "$PROJECT_ROOT"
+```
+
+The reminder text spells out the exact command per action. Direct Edit/Write
+bypasses validation and is a security regression — don't do it.
 
 ## When you see "NIBLET CHECKPOINT (fast)"
 
@@ -36,16 +50,17 @@ A turn just ended. Before responding to the user:
    - "Why does Y work this way?"
    - "User prefers A over B because…"
 
-2. **Auto-write** to safe locations only:
-   - Project facts → `<project>/.claude/kb/<topic>.md`
-   - User preferences → `<project>/.claude/memory/feedback_<slug>.md`
+2. **Pipe an ACTION through `niblet-apply`** — never Edit/Write directly:
+   - Project facts → `ADD_KB_ENTRY` action with `topic` (slug, ending `.md`)
+   - User preferences → `UPDATE_MEMORY` action with `file=feedback_<slug>.md`
 
 3. **Do not** create skills, commands, or modify CLAUDE.md here.
    Those happen in the DEEP checkpoint as proposals.
 
-4. **Update over create.** Edit existing files when possible. No duplicates.
+4. **Update over create.** Reuse an existing slug to land in the same file.
+   The helper happily writes over an existing file; no duplicates needed.
 
-5. **Skip** trivial turns. Don't write empty files to clear the marker.
+5. **Skip** trivial turns. Don't fire ACTIONs to clear the marker.
 
 6. **Delete the marker** the reminder names:
    `rm <project>/.niblet/sessions/<session-id>/PENDING_FAST`
@@ -54,12 +69,11 @@ A turn just ended. Before responding to the user:
 
 ## When you see "NIBLET CHECKPOINT (deep)"
 
-The session ended (or hit the safety-net counter). Time for workflow-pattern
-extraction by a dedicated sub-agent.
+A previous session has ended. Its raw log is queued for analysis.
 
 1. **Spawn** a `general-purpose` sub-agent via Task tool. Use the prompt
-   verbatim from the reminder — it names the raw log path and the strict
-   JSONL output format.
+   verbatim from the reminder — it names the **queued raw log** (not the
+   current session's), the slug constraints, and the strict JSONL format.
 
 2. **Wait** for output between sentinels:
    ```
@@ -68,18 +82,41 @@ extraction by a dedicated sub-agent.
    <<<NIBLET ACTIONS END>>>
    ```
 
-3. **Route each action** by the table in the reminder. Critical:
-   - `ADD_KB_ENTRY` scope=project → write to `.claude/kb/` (auto)
-   - `UPDATE_MEMORY` scope=project → write to `.claude/memory/` (auto)
-   - **Everything else** → write a **proposal file** to `.niblet/proposals/`
-     (or `~/.niblet-proposals/` for global scope). Include the intended
-     target path in the proposal's frontmatter so the user can `mv` it
-     to its destination after review.
+3. **Pipe each ACTION line** through `niblet-apply` — the helper enforces
+   slug rules, containment, and the auto vs proposal routing. You don't
+   route yourself; the helper does. Watch its stdout:
+   ```
+   applied: ADD_KB_ENTRY -> /…/.claude/kb/auth.md
+   proposal: CREATE_SKILL -> /…/.niblet/proposals/<ts>-<slug>.md
+   ```
+   Anything rejected (bad slug, path escape) lands as a proposal with a
+   `rejected_reason` so the user can see what the sub-agent tried.
 
-4. **Reset** the counter and **delete** markers per the reminder.
+4. **Delete the queue entry** the reminder names:
+   `rm <project>/.niblet/pending_deep/<ts>-<session>.queue`
 
-5. **Tell the user briefly** how many proposals are pending and where, then
-   respond to their actual request.
+5. **Tell the user briefly** what was applied vs proposed, including
+   `<project>/.niblet/proposals/` so they can review with
+   `bin/niblet-promote` — never raw `mv`. Then respond to their request.
+
+## Proposal promotion — `bin/niblet-promote`
+
+When the user has reviewed a proposal and wants to apply it, the canonical
+command is:
+
+```bash
+"${CLAUDE_PLUGIN_ROOT}/bin/niblet-promote" <proposal-file>
+```
+
+The helper is action-aware:
+- `CREATE_SKILL` / `CREATE_COMMAND` / `ADD_KB_ENTRY` / `UPDATE_MEMORY` →
+  strips the envelope, writes the payload to the target path.
+- `UPDATE_CLAUDE` → locates the named `## section` heading in the target
+  CLAUDE.md and **appends** the addition under it. Creates the section
+  if absent. Never overwrites the file.
+
+Plain `mv` would double-wrap SKILL frontmatter and replace CLAUDE.md
+wholesale — do not document `mv` as a promotion path.
 
 ## Proposal file format
 
@@ -95,8 +132,8 @@ created: <UTC timestamp>
  full SKILL.md including its own frontmatter>
 ```
 
-Filename pattern: `<UTCdate>-<short-slug>.md`
-(e.g. `20260527T103412Z-rebase-no-amend-skill.md`).
+Filename pattern: `<UTCdate>-<ACTION>-<short-slug>.md`
+(e.g. `20260527T103412Z-CREATE_SKILL-rebase-no-amend.md`).
 
 ## What NOT to save
 

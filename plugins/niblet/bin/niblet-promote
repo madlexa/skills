@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# niblet-promote — action-aware promotion of a proposal file into its target.
+#
+# Replacement for the naive `mv proposal target` workflow, which would
+# double-wrap SKILL.md frontmatter and silently overwrite CLAUDE.md instead
+# of appending. This script reads the proposal envelope, determines the
+# action, and applies the correct operation:
+#
+#   ADD_KB_ENTRY / UPDATE_MEMORY / CREATE_SKILL / CREATE_COMMAND
+#     → strip envelope, write payload to "target".
+#   UPDATE_CLAUDE
+#     → locate the named "## section" heading in target CLAUDE.md and
+#       append the payload under it. Creates the heading if missing.
+#       Never overwrites the file.
+#
+# All target paths are containment-checked before any write. On success
+# the proposal file is removed.
+#
+# Usage:
+#   niblet-promote <proposal-file>
+#
+# Exit codes:
+#   0  promoted
+#   65 proposal file unreadable or missing required fields
+#   66 target path containment / sanity check failed
+#   70 internal error (missing tool)
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+. "$SCRIPT_DIR/../lib/paths.sh"
+. "$SCRIPT_DIR/../lib/sanitize.sh"
+
+PROPOSAL="$1"
+[ -n "$PROPOSAL" ] || { echo "usage: niblet-promote <proposal-file>" >&2; exit 64; }
+[ -f "$PROPOSAL" ] || { echo "no such file: $PROPOSAL" >&2; exit 65; }
+
+# Parse the YAML-ish envelope at the top.
+envelope_field() {
+  local key="$1"
+  awk -v K="$key" '
+    /^---$/ { c++; next }
+    c == 1 {
+      if (match($0, "^"K"[[:space:]]*:[[:space:]]*")) {
+        v = substr($0, RLENGTH + 1)
+        sub(/[[:space:]]+$/, "", v)
+        print v
+        exit
+      }
+    }
+    c >= 2 { exit }
+  ' "$PROPOSAL"
+}
+
+# Extract payload (everything after the second --- separator).
+extract_payload() {
+  awk '
+    /^---$/ { c++; if (c == 2) { in_body = 1; next } }
+    in_body { print }
+  ' "$PROPOSAL"
+}
+
+ACTION="$(envelope_field action)"
+SCOPE="$( envelope_field scope)"
+TARGET="$(envelope_field target)"
+SECTION="$(envelope_field section)"
+
+[ -n "$ACTION" ] || { echo "proposal missing 'action' field" >&2; exit 65; }
+[ -n "$TARGET" ] || { echo "proposal missing 'target' field" >&2; exit 65; }
+
+# Decide the allowed root for containment.
+allowed_root() {
+  case "$ACTION" in
+    CREATE_SKILL|CREATE_COMMAND|ADD_KB_ENTRY|UPDATE_MEMORY)
+      # Strip /SKILL.md or /<file>.md suffix to get the artifact dir; check
+      # that the target stays under the appropriate niblet dir.
+      local rt
+      rt="$(crystallizer_runtime_home 2>/dev/null || echo "$HOME/.claude")"
+      # Accept either project artifact dirs or runtime home subtrees.
+      local pr; pr="$(niblet_project_root "$PWD")"
+      if [ "$SCOPE" = "global" ]; then
+        echo "$rt"
+      else
+        echo "$pr/.claude"
+      fi
+      ;;
+    UPDATE_CLAUDE)
+      niblet_project_root "$PWD"
+      ;;
+    *)
+      echo ""
+      ;;
+  esac
+}
+
+ROOT="$(allowed_root)"
+[ -n "$ROOT" ] || { echo "unknown action: $ACTION" >&2; exit 65; }
+
+if ! niblet_assert_under_dir "$TARGET" "$ROOT" 2>/dev/null; then
+  echo "containment check failed: $TARGET not under $ROOT" >&2
+  exit 66
+fi
+
+case "$ACTION" in
+  ADD_KB_ENTRY|UPDATE_MEMORY|CREATE_SKILL|CREATE_COMMAND)
+    mkdir -p "$(dirname "$TARGET")"
+    extract_payload > "$TARGET"
+    echo "promoted: $ACTION -> $TARGET"
+    rm -f "$PROPOSAL"
+    ;;
+
+  UPDATE_CLAUDE)
+    [ -n "$SECTION" ] || { echo "UPDATE_CLAUDE missing 'section'" >&2; exit 65; }
+    local_payload="$(extract_payload)"
+    if [ ! -f "$TARGET" ]; then
+      {
+        echo "## $SECTION"
+        echo ""
+        printf '%s\n' "$local_payload"
+      } > "$TARGET"
+      echo "promoted: UPDATE_CLAUDE -> $TARGET (created)"
+      rm -f "$PROPOSAL"
+      exit 0
+    fi
+    # If section heading exists, append payload right after the heading.
+    # If not, append a new "## section" block at the end.
+    if grep -qE "^## ${SECTION}[[:space:]]*$" "$TARGET"; then
+      # Use awk to insert payload after the heading line.
+      tmp="$(mktemp)"
+      awk -v sec="## $SECTION" -v add="$local_payload" '
+        BEGIN { inserted = 0 }
+        {
+          print
+          if (!inserted && $0 == sec) {
+            print ""
+            print add
+            inserted = 1
+          }
+        }
+      ' "$TARGET" > "$tmp"
+      mv "$tmp" "$TARGET"
+      echo "promoted: UPDATE_CLAUDE -> $TARGET (appended under '$SECTION')"
+    else
+      printf '\n## %s\n\n%s\n' "$SECTION" "$local_payload" >> "$TARGET"
+      echo "promoted: UPDATE_CLAUDE -> $TARGET (added section '$SECTION')"
+    fi
+    rm -f "$PROPOSAL"
+    ;;
+
+  *)
+    echo "promote not implemented for action: $ACTION" >&2
+    exit 65
+    ;;
+esac

@@ -5,10 +5,10 @@
 #   - Ensure store and per-session subdir exist (idempotent).
 #   - Touch PENDING_FAST for THIS session.
 #   - Increment THIS session's task counter.
-#   - SAFETY NET ONLY: if counter ≥ NIBLET_DEEP_THRESHOLD (default 20) also
-#     touch PENDING_DEEP. This is meant for marathon sessions where the
-#     SessionEnd event never fires. Normal sessions get their DEEP pass
-#     from on_session_end.sh, not from this threshold.
+#   - SAFETY NET ONLY: if counter ≥ NIBLET_DEEP_THRESHOLD (default 20),
+#     write a queue file to <store>/pending_deep/ and reset the counter.
+#     This is meant for marathon sessions where SessionEnd never fires.
+#     Normal sessions get their DEEP pass from on_session_end.sh.
 #
 # Per-session paths guarantee parallel sessions don't clobber each other.
 
@@ -36,8 +36,10 @@ SESSION="$(field session_id)"; [ -z "$SESSION" ] && SESSION="unknown"
 
 PROJECT_ROOT="$(niblet_project_root "$CWD")"
 niblet_ensure_store "$PROJECT_ROOT" "$SESSION" >/dev/null
+STORE="$(niblet_store "$PROJECT_ROOT")"
 SESSION_DIR="$(niblet_session_dir "$PROJECT_ROOT" "$SESSION")"
 [ -n "$SESSION_DIR" ] || exit 0
+[ -n "$STORE" ] || exit 0
 
 # Per-turn FAST checkpoint (always).
 touch "$SESSION_DIR/PENDING_FAST" 2>/dev/null
@@ -49,10 +51,25 @@ COUNT=0
 COUNT=$((COUNT + 1))
 printf '%s' "$COUNT" > "$COUNTER_FILE" 2>/dev/null
 
-# DEEP only on safety-net threshold for marathon sessions. Normal DEEP
-# triggering is on_session_end.sh.
+# Safety net only: marathon sessions where SessionEnd never fires.
+# Normal DEEP comes from on_session_end.sh via the project queue.
+# The safety-net entry is also placed on the project queue so the
+# CURRENT session can pick it up on its NEXT UserPromptSubmit.
 if [ "$COUNT" -ge "$DEEP_THRESHOLD" ]; then
-  touch "$SESSION_DIR/PENDING_DEEP" 2>/dev/null
+  QUEUE_DIR="$STORE/pending_deep"
+  mkdir -p "$QUEUE_DIR" 2>/dev/null
+  TS="$(date -u +%Y%m%dT%H%M%SZ)"
+  QUEUE_FILE="$QUEUE_DIR/${TS}-${SESSION}-safetynet.queue"
+  if [ ! -f "$QUEUE_FILE" ]; then
+    {
+      echo "session_id=$SESSION"
+      echo "raw_log=$STORE/raw/${SESSION}.jsonl"
+      echo "turns=$COUNT"
+      echo "ended_at=safety-net@$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$QUEUE_FILE" 2>/dev/null
+  fi
+  # Reset counter so we don't emit a queue file on every subsequent turn.
+  printf 0 > "$COUNTER_FILE" 2>/dev/null
 fi
 
 exit 0

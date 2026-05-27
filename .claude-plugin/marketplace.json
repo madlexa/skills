@@ -8,7 +8,7 @@
     {
       "name": "niblet",
       "source": "./plugins/niblet",
-      "description": "The diligent crumb-keeper for AI coding sessions. Niblet auto-writes findings to the project KB after every turn and surfaces workflow-pattern proposals at session end for your review. Sanitized capture — no secrets stored in logs. Per-session isolated.",
+      "description": "The diligent crumb-keeper for AI coding sessions. Niblet auto-writes findings to the project KB after every turn and surfaces workflow-pattern proposals at session end for your review. Sanitized capture — no secrets stored in logs. Per-session isolated. POSIX shell — macOS/Linux native; Windows via WSL2 or Git Bash.",
       "version": "0.2.0",
       "keywords": ["knowledge", "memory", "session", "scribe", "kb", "skills", "compounding"],
       "author": {

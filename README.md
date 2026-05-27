@@ -28,9 +28,10 @@ To update later:
 ### niblet (v0.2.0)
 
 The diligent crumb-keeper for AI coding sessions. After every turn, Niblet
-auto-writes findings to the project knowledge base. At session end, a
-sub-agent extracts reusable workflow patterns and lands them as proposals
-you review before promoting.
+auto-writes findings to the project knowledge base via a single secure
+helper. At session end, a sub-agent extracts reusable workflow patterns and
+lands them as proposals you review before promoting (via the action-aware
+`niblet-promote` helper — never a raw `mv`).
 
 **Two layers, two trust tiers:**
 - **FAST** (every turn) — agent writes findings to `.claude/kb/` and memory
@@ -44,8 +45,15 @@ you review before promoting.
 code. `tool_input` and `tool_response` content (where secrets and untrusted
 text live) is never stored. Closes the persistent prompt-injection vector.
 
-**Per-session isolation** — markers and counters scoped to
-`<project>/.niblet/sessions/<session-id>/`. Parallel sessions never share state.
+**Validated writes** — every ACTION the agent applies goes through
+`bin/niblet-apply`, which enforces slug rules and canonical path
+containment. Sub-agent-supplied filenames cannot escape their allowed dir.
+
+**Cross-session DEEP queue** — `SessionEnd` writes a queue entry that any
+subsequent session drains, even with a new session id. No orphan markers.
+
+**Honest KB surfacing** — a SessionStart hook emits a compact KB index
+reminder so the agent knows which `.claude/kb/` topics exist.
 
 See [plugins/niblet/README.md](plugins/niblet/README.md).
 
@@ -64,6 +72,14 @@ skills/
         ├── hooks/
         └── ...
 ```
+
+## Platform support
+
+Plugins in this marketplace ship as POSIX shell scripts. They run natively
+on **macOS** and **Linux**. Windows users need **WSL2** (recommended) or
+**Git Bash** — `cmd.exe` and PowerShell are not supported. See each
+plugin's README for its specific dependencies (typically `bash`, `jq`,
+`python3`, and `git`).
 
 ## Local development
 
