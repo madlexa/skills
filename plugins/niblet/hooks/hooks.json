@@ -16,17 +16,17 @@
         ]
       }
     ],
-    "SubagentStop": [
-      {
-        "hooks": [
-          { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/on_subagent_stop.sh" }
-        ]
-      }
-    ],
     "Stop": [
       {
         "hooks": [
           { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/on_stop.sh" }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/on_session_end.sh" }
         ]
       }
     ],

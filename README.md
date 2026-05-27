@@ -25,20 +25,27 @@ To update later:
 
 ## Plugins
 
-### niblet
+### niblet (v0.2.0)
 
-The diligent crumb-keeper for AI coding sessions. After every subtask, Niblet
-quietly notes what was discovered — findings about the codebase, workflows
-that worked, gotchas, user preferences — and writes them to the right place
-(KB entry, workflow skill, command, or memory file). Next session, all of it
-is already there.
+The diligent crumb-keeper for AI coding sessions. After every turn, Niblet
+auto-writes findings to the project knowledge base. At session end, a
+sub-agent extracts reusable workflow patterns and lands them as proposals
+you review before promoting.
 
-**Hybrid design:**
-- **FAST layer** — main agent jots findings inline after each subtask
-- **DEEP layer** — sub-agent extracts reusable workflow patterns at session end
+**Two layers, two trust tiers:**
+- **FAST** (every turn) — agent writes findings to `.claude/kb/` and memory
+  feedback. Auto-write, local, reversible.
+- **DEEP** (SessionEnd) — sub-agent extracts workflow patterns; everything
+  that could affect future sessions (skills, commands, CLAUDE.md edits, any
+  global write) is staged as a proposal in `.niblet/proposals/`. You promote
+  via `mv`.
 
-**Per-project** storage, auto-`.gitignore` of raw logs, `.claude/kb/` and
-`.claude/skills/niblet/` committed to git so the whole team benefits.
+**Sanitized capture** — observe.sh logs only tool name + safe path + exit
+code. `tool_input` and `tool_response` content (where secrets and untrusted
+text live) is never stored. Closes the persistent prompt-injection vector.
+
+**Per-session isolation** — markers and counters scoped to
+`<project>/.niblet/sessions/<session-id>/`. Parallel sessions never share state.
 
 See [plugins/niblet/README.md](plugins/niblet/README.md).
 

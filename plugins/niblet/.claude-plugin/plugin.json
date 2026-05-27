@@ -1,8 +1,8 @@
 {
   "name": "niblet",
   "displayName": "Niblet",
-  "version": "0.1.0",
-  "description": "The diligent crumb-keeper for AI coding sessions. After every subtask, Niblet quietly writes findings to the project knowledge base; at session end a sub-agent extracts reusable workflow patterns into skills. Hook-driven, per-project, with auto-gitignore.",
+  "version": "0.2.0",
+  "description": "The diligent crumb-keeper for AI coding sessions. After every turn, Niblet writes findings to the project KB (auto). At SessionEnd a sub-agent extracts workflow patterns and lands them as proposals you review before promotion. Sanitized capture — no tool content stored. Hook-driven, per-session isolated, with auto-gitignore.",
   "author": {
     "name": "madlexa"
   },

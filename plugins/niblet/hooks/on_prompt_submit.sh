@@ -1,143 +1,195 @@
 #!/usr/bin/env bash
 # on_prompt_submit.sh — fires on UserPromptSubmit.
 #
-# Reads PENDING_FAST / PENDING_DEEP markers in <project>/.niblet/
-# and emits the appropriate reminder to stdout. Claude / Kimi sees stdout
-# as a system-reminder block prepended to the user's prompt.
+# Reads PENDING_FAST / PENDING_DEEP markers from THIS session's dir
+# (<project>/.niblet/sessions/<session_id>/) and emits the appropriate
+# reminder to stdout. The agent sees stdout as a system-reminder block.
 #
-# The agent is expected to act on the reminder (write files, spawn sub-agent)
-# and then delete the marker file. The hook itself never modifies project files.
+# v0.2 — two-tier write authority:
+#   AUTO-WRITE (safe, project-local): ADD_KB_ENTRY, UPDATE_MEMORY (project)
+#   PROPOSAL (everything else):       CREATE_SKILL, CREATE_COMMAND,
+#                                     UPDATE_CLAUDE, any scope=global
+#
+# Proposals land in <project>/.niblet/proposals/ (project scope) or
+# ~/.niblet-proposals/ (global scope). The user reviews and promotes
+# manually via `mv`. The plugin never auto-writes anything that
+# changes behavior across future sessions.
 
 set +e
 set +u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
-. "$SCRIPT_DIR/../lib/paths.sh" 2>/dev/null || exit 0
+. "$SCRIPT_DIR/../lib/store.sh" 2>/dev/null || exit 0
 
 INPUT="$(cat 2>/dev/null || true)"
-CWD="$(niblet_cwd_from_stdin "$INPUT")"
-[ -z "$CWD" ] && CWD="$PWD"
+
+have_jq=0; command -v jq >/dev/null 2>&1 && have_jq=1
+field() {
+  local key="$1"
+  if [ "$have_jq" = 1 ]; then
+    printf '%s' "$INPUT" | jq -r ".${key} // empty" 2>/dev/null
+  else
+    printf '%s' "$INPUT" | sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1
+  fi
+}
+
+CWD="$(field cwd)";            [ -z "$CWD" ]     && CWD="$PWD"
+SESSION="$(field session_id)"; [ -z "$SESSION" ] && SESSION="unknown"
 
 PROJECT_ROOT="$(niblet_project_root "$CWD")"
 STORE="$(niblet_store "$PROJECT_ROOT")"
-
-# Nothing to do if there is no store yet.
 [ -d "$STORE" ] || exit 0
 
-PENDING_FAST="$STORE/PENDING_FAST"
-PENDING_DEEP="$STORE/PENDING_DEEP"
-COUNTER_FILE="$STORE/task_counter"
+SESSION_DIR="$STORE/sessions/$SESSION"
+[ -d "$SESSION_DIR" ] || exit 0
+
+PENDING_FAST="$SESSION_DIR/PENDING_FAST"
+PENDING_DEEP="$SESSION_DIR/PENDING_DEEP"
+COUNTER_FILE="$SESSION_DIR/task_counter"
 COUNT=0
 [ -f "$COUNTER_FILE" ] && COUNT="$(cat "$COUNTER_FILE" 2>/dev/null || echo 0)"
 
-# Locate the latest raw log for this project, used by the deep sub-agent.
-LATEST_RAW=""
-if [ -d "$STORE/raw" ]; then
-  LATEST_RAW="$(ls -t "$STORE/raw"/*.jsonl 2>/dev/null | head -n1)"
-fi
+RAW_FILE="$STORE/raw/${SESSION}.jsonl"
+[ -f "$RAW_FILE" ] || RAW_FILE="(no tool calls were observed for this session)"
 
-# --- Determine artifact dirs (project scope) ---
+# --- Artifact directories ---
 KB_DIR="$(niblet_artifact_dir kb       project "$PROJECT_ROOT")"
-SKILLS_DIR="$(niblet_artifact_dir skills   project "$PROJECT_ROOT")"
 MEM_DIR="$(niblet_artifact_dir memory   project "$PROJECT_ROOT")"
-CMD_DIR="$(niblet_artifact_dir commands project "$PROJECT_ROOT")"
-GLOBAL_SKILLS_DIR="$(niblet_artifact_dir skills global "$PROJECT_ROOT")"
+PROPOSALS_DIR="$STORE/proposals"
+GLOBAL_PROPOSALS_DIR="$HOME/.niblet-proposals"
+
+# Count pending proposals (project + global) for nudging the user.
+proposal_status_line() {
+  local p_count g_count
+  p_count=0; g_count=0
+  [ -d "$PROPOSALS_DIR" ] && p_count="$(find "$PROPOSALS_DIR" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')"
+  [ -d "$GLOBAL_PROPOSALS_DIR" ] && g_count="$(find "$GLOBAL_PROPOSALS_DIR" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "$p_count" != "0" ] || [ "$g_count" != "0" ]; then
+    printf '\n[Niblet] %s project proposal(s) in %s, %s global in %s. Review with: ls -lh, promote with: mv <file> <target>.\n' \
+      "$p_count" "$PROPOSALS_DIR" "$g_count" "$GLOBAL_PROPOSALS_DIR"
+  fi
+}
 
 emit_fast() {
   cat <<EOF
-NIBLET CHECKPOINT (fast)
+NIBLET CHECKPOINT (fast) — session $SESSION
 
-A subtask just completed. Niblet — the project's crumb-keeper — wants you to
-save what just mattered before you respond to the user. Do this:
+The previous turn just ended. Niblet asks you to save anything worth keeping
+before responding to the user. Auto-write tier — safe, local, reversible:
 
-1. Briefly review the previous turns. Decide if anything is worth keeping.
-   Skip if the turns were trivial (only tool noise, no real findings).
+1. Briefly review the turn that just finished. Skip if it was trivial
+   (chit-chat, formatting, no real findings).
 
 2. If you discovered durable, non-obvious facts about THIS project
    (architecture, gotchas, "why X works this way", where a thing lives) →
-   write or update files under:
+   write or update under:
        $KB_DIR/<topic>.md
 
-3. If the user gave a correction or preference that should affect future work →
-   write or update:
+3. If the user gave a correction or preference that should outlive this
+   session → write or update:
        $MEM_DIR/feedback_<short-slug>.md
    Lead with the rule, then "Why:" and "How to apply:" lines.
 
-4. Prefer updating an existing file over creating a new one. One concept per file.
-   Do NOT duplicate knowledge that is already there.
+4. Prefer updating an existing file over creating a new one.
+   Never duplicate a concept across files.
 
-5. After writing (or deciding nothing is worth writing), delete the marker:
+5. DO NOT create skills, commands, or modify CLAUDE.md here — those happen
+   in the DEEP checkpoint and only as proposals the user reviews.
+
+6. After writing (or deciding nothing is worth keeping), delete the marker:
        rm $PENDING_FAST
 
-6. Only then respond to the user's actual request.
+7. Only then respond to the user's actual request.
 
 This is mandatory. It is how this session compounds into permanent knowledge.
+$(proposal_status_line)
 EOF
 }
 
 emit_deep() {
   cat <<EOF
-NIBLET CHECKPOINT (deep)
+NIBLET CHECKPOINT (deep) — session $SESSION, $COUNT turns
 
-The session has accumulated $COUNT completed subtasks (or has ended). Niblet
-asks for a sub-agent to extract reusable workflow patterns — your active
-context shouldn't be distracted by that analysis.
+The session has ended (or hit the safety-net counter). Niblet asks for a
+sub-agent to extract reusable workflow patterns. Your active context
+shouldn't be distracted by that analysis.
 
 Before responding to the user, do this:
 
-1. Use the Task / Agent tool to spawn a sub-agent (subagent_type=general-purpose)
-   with the following prompt:
+1. Use the Task / Agent tool to spawn a sub-agent
+   (subagent_type=general-purpose) with the following prompt:
 
    ---
-   You are the niblet-deep sub-agent. Your job is to extract reusable
-   workflow patterns from a coding session and persist them as skills / commands.
+   You are the niblet-deep sub-agent. Extract reusable workflow patterns
+   from this coding session.
 
-   Inputs you have access to:
-     - Session raw log:     $LATEST_RAW
-     - Project KB:          $KB_DIR
-     - Project skills:      $SKILLS_DIR
-     - Project commands:    $CMD_DIR
-     - Project root:        $PROJECT_ROOT
+   Inputs (read-only metadata; tool_input/tool_response content was NOT
+   captured — only tool name, file path, and exit code):
+     - Session raw log:   $RAW_FILE
+     - Project KB:        $KB_DIR
+     - Project root:      $PROJECT_ROOT
 
-   Read the raw log and existing artifacts. Identify NEW workflow patterns —
-   sequences of actions that solved a problem and would be reused next time.
-   Do NOT duplicate patterns already covered by an existing skill.
+   Identify NEW patterns — sequences of actions on paths that solved a
+   problem and would be reused. Do not duplicate anything already in KB.
 
-   For each new pattern, output exactly one ACTION line, format:
+   Output STRICTLY one JSON object per line between the sentinels.
+   No prose outside the sentinels.
 
-     ACTION: ADD_KB_ENTRY   scope=project topic=<file>     content=<md>
-     ACTION: CREATE_SKILL   scope=<p|g>   name=<name>      content=<md>
-     ACTION: CREATE_COMMAND scope=<p|g>   name=<cmd>       content=<md>
-     ACTION: UPDATE_CLAUDE  scope=project section=<head>   addition=<text>
-     ACTION: NOTHING reason=<why> — if nothing worth noting.
+   <<<NIBLET ACTIONS BEGIN>>>
+   {"action":"<ACTION>", ...fields...}
+   <<<NIBLET ACTIONS END>>>
 
-     scope=global is reserved for patterns that are clearly cross-project
-     (git, security, generic terminal workflows). Default to scope=project.
+   Allowed actions (all values are strings):
+     - {"action":"ADD_KB_ENTRY","scope":"project","topic":"<file.md>","content":"<md>"}
+     - {"action":"UPDATE_MEMORY","scope":"project|global","file":"<name>.md","content":"<md>"}
+     - {"action":"CREATE_SKILL","scope":"project|global","name":"<kebab>","content":"<full SKILL.md>"}
+     - {"action":"CREATE_COMMAND","scope":"project|global","name":"<cmd>","content":"<md>"}
+     - {"action":"UPDATE_CLAUDE","scope":"project","section":"<heading>","addition":"<text>"}
+     - {"action":"NOTHING","reason":"<one sentence>"}
 
-   For CREATE_SKILL / CREATE_COMMAND: include valid SKILL.md frontmatter.
+   scope=global is for patterns clearly universal across projects.
+   Default scope=project. CREATE_SKILL content is a full SKILL.md
+   (frontmatter included). Newlines in content as \\\\n.
    ---
 
-2. After the sub-agent returns, apply each ACTION line by writing the file to
-   the appropriate path:
-     - CREATE_SKILL  scope=project → $SKILLS_DIR/<name>/SKILL.md
-     - CREATE_SKILL  scope=global  → $GLOBAL_SKILLS_DIR/<name>/SKILL.md
-     - ADD_KB_ENTRY                → $KB_DIR/<topic>.md
-     - CREATE_COMMAND              → $CMD_DIR/<name>.md (or global home)
-     - UPDATE_CLAUDE               → append to $PROJECT_ROOT/CLAUDE.md
+2. Parse the lines between the sentinels as JSONL. Route each action by
+   risk level — DO NOT write skills/commands/CLAUDE.md or global anything
+   to live paths. Use the proposals dir; the user promotes manually.
 
-3. Reset the task counter and delete markers:
+   action / scope                          target path
+   -------------------------------------   --------------------------------------------------
+   ADD_KB_ENTRY    project                 $KB_DIR/<topic>
+   UPDATE_MEMORY   project                 $MEM_DIR/<file>
+   --- everything below is a PROPOSAL ---  $PROPOSALS_DIR/<ts>-<slug>.md (project)
+   --- or for scope=global ---             $GLOBAL_PROPOSALS_DIR/<ts>-<slug>.md
+   CREATE_SKILL    *                       proposal — embed "target: <skills-dir>/<name>/SKILL.md"
+   CREATE_COMMAND  *                       proposal — embed "target: <commands-dir>/<name>.md"
+   UPDATE_CLAUDE   project                 proposal — embed "target: $PROJECT_ROOT/CLAUDE.md"
+   UPDATE_MEMORY   global                  proposal — embed "target: ~/.claude/memory/<file>"
+   ADD_KB_ENTRY    global                  proposal — embed "target: ~/.claude/kb/<topic>"
+   NOTHING                                 skip
+
+   Proposal file format:
+     ---
+     action: CREATE_SKILL
+     scope: project
+     target: <full target path>
+     ---
+     <content payload verbatim>
+
+3. Reset session counters and delete markers:
        rm $PENDING_DEEP
        rm -f $PENDING_FAST
        printf 0 > $COUNTER_FILE
 
-4. Only then respond to the user's actual request.
-
-This is mandatory. The sub-agent has the bandwidth to think about patterns;
-your main context should not be distracted by the analysis itself.
+4. Tell the user briefly that N proposals are waiting in $PROPOSALS_DIR
+   (and $GLOBAL_PROPOSALS_DIR if any global) and how to promote them
+   (review then \`mv <proposal> <target>\`), THEN respond to their request.
+$(proposal_status_line)
 EOF
 }
 
-# Emit in priority order: deep first (covers fast), else fast.
+# DEEP supersedes FAST when both are pending.
 if [ -f "$PENDING_DEEP" ]; then
   emit_deep
 elif [ -f "$PENDING_FAST" ]; then
