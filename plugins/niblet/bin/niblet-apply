@@ -32,9 +32,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
-. "$SCRIPT_DIR/../lib/paths.sh"
 . "$SCRIPT_DIR/../lib/sanitize.sh"
-. "$SCRIPT_DIR/../lib/gitignore.sh"
 . "$SCRIPT_DIR/../lib/store.sh"
 
 # ---- args ----

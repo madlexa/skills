@@ -87,7 +87,13 @@ if grep -qE "SECRET_API_KEY|sk-abc123|OPENAI_KEY|LEAK_TOKEN|super-secret" "$RAW"
 else
   pass "no secrets leaked from tool_input/tool_response"
 fi
-grep -qxF ".niblet/" "$PROJECT/.gitignore" && pass ".gitignore auto-added" || fail "no gitignore"
+[ -f "$PROJECT/.niblet/.gitignore" ] && pass ".niblet/.gitignore created" || fail "no .niblet/.gitignore"
+[ "$(cat "$PROJECT/.niblet/.gitignore")" = "*" ] && pass ".niblet/.gitignore contains '*'" \
+  || fail ".niblet/.gitignore wrong content: $(cat "$PROJECT/.niblet/.gitignore" 2>/dev/null)"
+[ ! -f "$PROJECT/.gitignore" ] && pass "root .gitignore NOT created/modified by niblet" \
+  || { grep -qxF ".niblet/" "$PROJECT/.gitignore" \
+    && fail "root .gitignore was modified with .niblet/ entry — regression!" \
+    || pass "root .gitignore exists but does NOT contain .niblet/ entry"; }
 
 title "2. on_stop.sh per-session PENDING_FAST + counter"
 event_stop "$SESSION_A" "$PROJECT" | "$HOOKS/on_stop.sh" >/dev/null

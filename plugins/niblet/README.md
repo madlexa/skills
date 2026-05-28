@@ -87,7 +87,7 @@ Session
   ├── Observer (PreToolUse / PostToolUse hooks)
   │     observe.sh — SANITIZED capture: tool name + safe path + exit code.
   │     Never logs tool_input/tool_response content (secret-safe).
-  │     Initializes .niblet/ + .gitignore on first call (idempotent).
+  │     Initializes .niblet/ + writes .niblet/.gitignore on first call (idempotent).
   │
   ├── Stop hook (after every turn)
   │     on_stop.sh: touch sessions/<id>/PENDING_FAST, counter++
@@ -331,10 +331,9 @@ niblet/
 │   └── niblet-status                  # project dashboard (counts + paths only)
 ├── lib/
 │   ├── paths.sh                       # runtime + project root + artifact dirs
-│   ├── gitignore.sh                   # idempotent .gitignore add
 │   ├── jsonl.sh                       # JSONL helpers
 │   ├── sanitize.sh                    # safe path + slug + containment helpers
-│   ├── store.sh                       # ensure store + gitignore
+│   ├── store.sh                       # ensure store + write .niblet/.gitignore
 │   └── digest.sh                      # sanitized session digest writer
 └── tests/smoke_test.sh                # contract test suite (~149 assertions)
 ```
