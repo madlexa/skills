@@ -43,6 +43,9 @@ STORE="$(niblet_store "$PROJECT_ROOT")"
 QUEUE_DIR="$STORE/pending_deep"
 SESSION_DIR="$STORE/sessions/$SESSION"
 PENDING_FAST="$SESSION_DIR/PENDING_FAST"
+DISTILL_QUEUE_DIR="$STORE/distill_queue"
+DISTILL_QUEUED_FLAG="$SESSION_DIR/DISTILL_QUEUED"
+AUDIT_QUEUE_DIR="$STORE/audit_queue"
 
 KB_DIR="$(niblet_artifact_dir kb       project "$PROJECT_ROOT")"
 MEM_DIR="$(niblet_artifact_dir memory   project "$PROJECT_ROOT")"
@@ -53,6 +56,43 @@ GLOBAL_PROPOSALS_DIR="$HOME/.niblet-proposals"
 # resolve without an absolute path. Avoid printing ${CLAUDE_PLUGIN_ROOT} in
 # reminders: it's an env var guaranteed only inside the plugin sandbox; the
 # agent shouldn't rely on it expanding everywhere.
+
+# Check KB size; if above threshold, write a distill queue entry at most once
+# per session. Uses a per-session flag to avoid double-queuing.
+_queue_distill_entry() {
+  mkdir -p "$DISTILL_QUEUE_DIR" "$SESSION_DIR" 2>/dev/null
+  local ts; ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  local target="$DISTILL_QUEUE_DIR/${ts}.distill"
+  # Write to a temp file then hard-link to the target name.
+  # ln fails with EEXIST if the target already exists, eliminating the TOCTOU
+  # race between the collision check and the write (same pattern as audit queue).
+  local _tmp; _tmp="$(mktemp "$DISTILL_QUEUE_DIR/XXXXXXXX.tmp" 2>/dev/null)" \
+    || _tmp="$DISTILL_QUEUE_DIR/.tmp-$$-${ts}"
+  echo "session_id=$SESSION" > "$_tmp" 2>/dev/null || { rm -f "$_tmp"; return; }
+  ln "$_tmp" "$target" 2>/dev/null || \
+    ln "$_tmp" "${target%.distill}-$$.distill" 2>/dev/null || true
+  rm -f "$_tmp"
+  touch "$DISTILL_QUEUED_FLAG" 2>/dev/null || true
+}
+
+maybe_queue_distill() {
+  [ -f "$DISTILL_QUEUED_FLAG" ] && return 0
+  [ -d "$KB_DIR" ] || return 0
+  local distill_count distill_bytes kb_count
+  distill_count="${NIBLET_KB_DISTILL_COUNT:-20}"
+  distill_bytes="${NIBLET_KB_DISTILL_BYTES:-200000}"
+  kb_count="$(find "$KB_DIR" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "$kb_count" -ge "$distill_count" ]; then
+    _queue_distill_entry; return 0
+  fi
+  local kb_sz
+  kb_sz="$(find "$KB_DIR" -maxdepth 1 -type f -exec wc -c {} + 2>/dev/null \
+    | awk 'END{print ($1+0)}')"
+  [ -z "$kb_sz" ] && kb_sz=0
+  [ "$kb_sz" -ge "$distill_bytes" ] && _queue_distill_entry
+}
+
+maybe_queue_distill
 
 # Atomically claim the oldest queue entry (FIFO) so two parallel new
 # sessions cannot both pick the same DEEP job. We rename `.queue` to
@@ -68,6 +108,34 @@ if [ -d "$QUEUE_DIR" ]; then
     CLAIMED="${CANDIDATE%.queue}.claimed-$SESSION"
     if mv -n "$CANDIDATE" "$CLAIMED" 2>/dev/null && [ -f "$CLAIMED" ]; then
       QUEUE_FILE="$CLAIMED"
+    fi
+  fi
+fi
+
+# Atomically claim the oldest distill queue entry (same mv -n pattern).
+DISTILL_FILE=""
+DISTILL_SIZE=0
+if [ -d "$DISTILL_QUEUE_DIR" ]; then
+  DISTILL_SIZE="$(ls -1 "$DISTILL_QUEUE_DIR"/*.distill 2>/dev/null | wc -l | tr -d ' ')"
+  DISTILL_CAND="$(ls -1 "$DISTILL_QUEUE_DIR"/*.distill 2>/dev/null | sort | head -n1)"
+  if [ -n "$DISTILL_CAND" ] && [ -f "$DISTILL_CAND" ]; then
+    DISTILL_CLAIMED="${DISTILL_CAND%.distill}.claimed-$SESSION"
+    if mv -n "$DISTILL_CAND" "$DISTILL_CLAIMED" 2>/dev/null && [ -f "$DISTILL_CLAIMED" ]; then
+      DISTILL_FILE="$DISTILL_CLAIMED"
+    fi
+  fi
+fi
+
+# Atomically claim the oldest audit queue entry (same mv -n pattern).
+AUDIT_FILE=""
+AUDIT_SIZE=0
+if [ -d "$AUDIT_QUEUE_DIR" ]; then
+  AUDIT_SIZE="$(ls -1 "$AUDIT_QUEUE_DIR"/*.audit 2>/dev/null | wc -l | tr -d ' ')"
+  AUDIT_CAND="$(ls -1 "$AUDIT_QUEUE_DIR"/*.audit 2>/dev/null | sort | head -n1)"
+  if [ -n "$AUDIT_CAND" ] && [ -f "$AUDIT_CAND" ]; then
+    AUDIT_CLAIMED="${AUDIT_CAND%.audit}.claimed-$SESSION"
+    if mv -n "$AUDIT_CAND" "$AUDIT_CLAIMED" 2>/dev/null && [ -f "$AUDIT_CLAIMED" ]; then
+      AUDIT_FILE="$AUDIT_CLAIMED"
     fi
   fi
 fi
@@ -185,10 +253,21 @@ Before responding to the user, do this:
 
    Allowed actions (all values are JSON strings; newlines in content as \\n):
      - {"action":"ADD_KB_ENTRY","scope":"project","topic":"<slug>.md","content":"<md>"}
-     - {"action":"UPDATE_MEMORY","scope":"project|global","file":"<slug>.md","content":"<md>"}
+     - {"action":"MERGE_KB_ENTRY","scope":"project","topic":"<slug>.md","content":"<md>","reason":"<why>"}
+     - {"action":"UPDATE_KB_ENTRY","scope":"project","topic":"<slug>.md","content":"<md>","reason":"<why>"}
+     - {"action":"DEPRECATE_KB_ENTRY","scope":"project","topic":"<slug>.md","reason":"<why>"}
+     - {"action":"UPDATE_MEMORY","scope":"project","file":"<slug>.md","content":"<md>"}
      - {"action":"CREATE_SKILL","scope":"project|global","name":"<slug>","content":"<full SKILL.md>"}
+     - {"action":"CREATE_AGENT","scope":"project|global","name":"<slug>","content":"<agent .md>"}
      - {"action":"CREATE_COMMAND","scope":"project|global","name":"<slug>","content":"<md>"}
+     - {"action":"CREATE_SCRIPT","scope":"project|global","name":"<slug>","content":"<bash or python>"}
+     - {"action":"UPDATE_SKILL","scope":"project|global","name":"<slug>","content":"<full SKILL.md>"}
+     - {"action":"UPDATE_AGENT","scope":"project|global","name":"<slug>","content":"<agent .md>"}
+     - {"action":"UPDATE_COMMAND","scope":"project|global","name":"<slug>","content":"<md>"}
+     - {"action":"UPDATE_SCRIPT","scope":"project|global","name":"<slug>","content":"<script>"}
      - {"action":"UPDATE_CLAUDE","scope":"project","section":"<heading>","addition":"<text>"}
+     - {"action":"OPEN_QUESTION","scope":"project","content":"<question>"}
+     - {"action":"AUDIT_REPORT","scope":"project","content":"<findings>"}
      - {"action":"NOTHING","reason":"<one sentence>"}
 
    Slugs are: 1..64 chars, [a-z0-9][a-z0-9._-]*. No slashes, no "..".
@@ -207,7 +286,7 @@ Before responding to the user, do this:
        niblet-apply --project-root "$PROJECT_ROOT" < $STORE/inbox/<random>.json
 
    The script validates slugs, enforces containment, and routes:
-     - ADD_KB_ENTRY/UPDATE_MEMORY scope=project   → auto-write
+     - ADD_KB_ENTRY/UPDATE_KB_ENTRY/MERGE_KB_ENTRY/DEPRECATE_KB_ENTRY/UPDATE_MEMORY scope=project → auto-write
      - everything else (skills, commands, CLAUDE, any global) → proposal
    Anything that fails slug or containment check lands as a proposal with
    "rejected_reason" so you can see what was attempted.
@@ -222,9 +301,160 @@ $(proposal_status_line)
 EOF
 }
 
-# Drain DEEP queue first; only fall back to FAST when queue is empty.
+emit_distill() {
+  cat <<EOF
+NIBLET CHECKPOINT (distill) — queue size $DISTILL_SIZE, processing $(basename "$DISTILL_FILE")
+
+The project KB has grown above the distill threshold. Niblet asks you to spawn
+a sub-agent to consolidate redundant or overlapping KB entries.
+
+Before responding to the user, do this:
+
+1. Use the Task / Agent tool with subagent_type=general-purpose and the
+   following prompt verbatim:
+
+   ---
+   You are the niblet-distill sub-agent. Consolidate and deduplicate
+   knowledge-base entries for this project.
+
+   Inputs:
+     - KB directory:      $KB_DIR
+     - Memory directory:  $MEM_DIR
+     - Digests directory: $STORE/digests
+     - Project root:      $PROJECT_ROOT
+
+   Read all files in the KB and memory directories. Identify duplicate or
+   overlapping entries, stale topics, and patterns that recur across 3+
+   digest sessions (suggesting a new skill or command).
+
+   Output STRICTLY one JSON object per line between the sentinels.
+   No prose outside the sentinels. Emit at most 5 actions.
+
+       <<<NIBLET ACTIONS BEGIN>>>
+       {"action":"<ACTION>", ...fields...}
+       <<<NIBLET ACTIONS END>>>
+
+   Allowed actions (all values are JSON strings; newlines in content as \\n):
+     - {"action":"MERGE_KB_ENTRY","scope":"project","topic":"<slug>.md","content":"<md>","reason":"<why>"}
+     - {"action":"UPDATE_KB_ENTRY","scope":"project","topic":"<slug>.md","content":"<md>","reason":"<why>"}
+     - {"action":"DEPRECATE_KB_ENTRY","scope":"project","topic":"<slug>.md","reason":"<why>"}
+     - {"action":"CREATE_SKILL","scope":"project","name":"<slug>","content":"<SKILL.md>","reason":"<why>"}
+     - {"action":"CREATE_AGENT","scope":"project","name":"<slug>","content":"<agent.md>","reason":"<why>"}
+     - {"action":"CREATE_COMMAND","scope":"project","name":"<slug>","content":"<md>","reason":"<why>"}
+     - {"action":"NOTHING","reason":"<one sentence>"}
+
+   Slugs: 1..64 chars, [a-z0-9][a-z0-9._-]*. No slashes, no "..".
+   Use scope=global only for universal patterns (git, security, terminal idioms).
+   ---
+
+2. Parse the lines between the sentinels. For EACH JSON object, stage it
+   via Write to a per-action file under $STORE/inbox/ and pipe THAT file
+   into niblet-apply — do NOT \`echo '<json>' | …\`:
+
+       Write file_path=$STORE/inbox/<random>.json   (the JSON object)
+       niblet-apply --project-root "$PROJECT_ROOT" < $STORE/inbox/<random>.json
+
+   The script validates slugs, enforces containment, and routes:
+     - MERGE_KB_ENTRY/UPDATE_KB_ENTRY scope=project  → auto-write
+     - DEPRECATE_KB_ENTRY scope=project              → auto-write
+     - everything else (CREATE_*, any global)        → proposal
+
+3. Delete the processed distill entry:
+       rm $DISTILL_FILE
+
+4. Tell the user briefly what was merged, deprecated, or proposed, including
+   the proposals directory path so they can review. Then respond to their
+   actual request.
+$(proposal_status_line)
+EOF
+}
+
+emit_audit() {
+  cat <<EOF
+NIBLET CHECKPOINT (audit) — queue size $AUDIT_SIZE, processing $(basename "$AUDIT_FILE")
+
+Niblet is running a periodic artifact audit. Before responding to the user,
+spawn a sub-agent to check KB, memory, and artifact index for staleness or
+contradictions.
+
+Before responding to the user, do this:
+
+1. Use the Task / Agent tool with subagent_type=general-purpose and the
+   following prompt verbatim:
+
+   ---
+   You are the niblet-audit sub-agent. Audit this project's niblet artifacts
+   for staleness, contradictions, and quality issues.
+
+   Inputs:
+     - Artifact index:    $STORE/index/artifacts.jsonl  (filenames only)
+     - KB directory:      $KB_DIR
+     - Memory directory:  $MEM_DIR
+     - Digests directory: $STORE/digests
+     - Project root:      $PROJECT_ROOT
+
+   Read the artifact index to know what skills/agents/commands/scripts exist.
+   Read KB and memory files. Read recent digests (if any).
+
+   Identify issues:
+   - KB entries referencing non-existent commands, paths, or artifacts
+   - Artifacts in the index not referenced by any KB entry (potentially stale)
+   - Contradictions between KB entries or between KB and memory
+   - Duplicate artifacts with overlapping purpose
+
+   Emit at most 5 actions per pass. Include evidence and confidence for each.
+
+   Output STRICTLY one JSON object per line between the sentinels.
+   No prose outside the sentinels.
+
+       <<<NIBLET ACTIONS BEGIN>>>
+       {"action":"<ACTION>", ...fields...}
+       <<<NIBLET ACTIONS END>>>
+
+   Allowed actions (all values are JSON strings; newlines in content as \\n):
+     - {"action":"UPDATE_KB_ENTRY","scope":"project","topic":"<slug>.md","content":"<md>","evidence":"<why>","confidence":"high|medium|low"}
+     - {"action":"DEPRECATE_KB_ENTRY","scope":"project","topic":"<slug>.md","reason":"<why>","evidence":"<why>","confidence":"high|medium|low"}
+     - {"action":"UPDATE_SKILL","scope":"project","name":"<slug>","content":"<SKILL.md>","evidence":"<why>","confidence":"high|medium|low"}
+     - {"action":"AUDIT_REPORT","scope":"project","content":"<findings summary>","evidence":"<details>","confidence":"high|medium|low"}
+     - {"action":"OPEN_QUESTION","scope":"project","content":"<question for human>"}
+     - {"action":"NOTHING","reason":"<one sentence>"}
+
+   Slugs: 1..64 chars, [a-z0-9][a-z0-9._-]*. No slashes, no "..".
+   ---
+
+2. Parse the lines between the sentinels. For EACH JSON object, stage it
+   via Write to a per-action file under $STORE/inbox/ and pipe THAT file
+   into niblet-apply — do NOT \`echo '<json>' | …\`:
+
+       Write file_path=$STORE/inbox/<random>.json   (the JSON object)
+       niblet-apply --project-root "$PROJECT_ROOT" < $STORE/inbox/<random>.json
+
+   The script validates slugs, enforces containment, and routes:
+     - UPDATE_KB_ENTRY/DEPRECATE_KB_ENTRY scope=project  → auto-write
+     - UPDATE_SKILL, AUDIT_REPORT, OPEN_QUESTION         → proposal
+
+3. Delete the processed audit entry:
+       rm $AUDIT_FILE
+
+4. Tell the user briefly what was updated, deprecated, or proposed, including
+   the proposals directory path so they can review. Then respond to their
+   actual request.
+$(proposal_status_line)
+EOF
+}
+
+# Drain order: DEEP > AUDIT > DISTILL > FAST
+# When a higher-priority entry wins, release any claimed lower-priority entries
+# back to their queues so a future session can pick them up (prevents stranding).
 if [ -n "$QUEUE_FILE" ] && [ -f "$QUEUE_FILE" ]; then
+  [ -n "$DISTILL_FILE" ] && [ -f "$DISTILL_FILE" ] && mv "$DISTILL_FILE" "$DISTILL_CAND" 2>/dev/null || true
+  [ -n "$AUDIT_FILE"   ] && [ -f "$AUDIT_FILE"   ] && mv "$AUDIT_FILE"   "$AUDIT_CAND"   2>/dev/null || true
   emit_deep
+elif [ -n "$AUDIT_FILE" ] && [ -f "$AUDIT_FILE" ]; then
+  [ -n "$DISTILL_FILE" ] && [ -f "$DISTILL_FILE" ] && mv "$DISTILL_FILE" "$DISTILL_CAND" 2>/dev/null || true
+  emit_audit
+elif [ -n "$DISTILL_FILE" ] && [ -f "$DISTILL_FILE" ]; then
+  emit_distill
 elif [ -f "$PENDING_FAST" ]; then
   emit_fast
 fi

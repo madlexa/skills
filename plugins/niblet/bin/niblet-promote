@@ -6,8 +6,17 @@
 # of appending. This script reads the proposal envelope, determines the
 # action, and applies the correct operation:
 #
-#   ADD_KB_ENTRY / UPDATE_MEMORY / CREATE_SKILL / CREATE_COMMAND
+#   ADD_KB_ENTRY / UPDATE_MEMORY / CREATE_SKILL / CREATE_COMMAND /
+#   CREATE_AGENT / MERGE_KB_ENTRY / UPDATE_KB_ENTRY
 #     → strip envelope, write payload to "target".
+#   CREATE_SCRIPT
+#     → strip envelope, re-validate syntax, write without executable bit.
+#   UPDATE_SKILL / UPDATE_AGENT / UPDATE_COMMAND / UPDATE_SCRIPT
+#     → create backup at <target>.niblet-backup, overwrite target.
+#   DEPRECATE_KB_ENTRY
+#     → rename target to <target>.deprecated.
+#   OPEN_QUESTION / AUDIT_REPORT
+#     → no-op (proposal already in proposals dir); removes proposal file.
 #   UPDATE_CLAUDE
 #     → locate the named "## section" heading in target CLAUDE.md and
 #       append the payload under it. Creates the heading if missing.
@@ -31,8 +40,80 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 . "$SCRIPT_DIR/../lib/paths.sh"
 . "$SCRIPT_DIR/../lib/sanitize.sh"
 
+# --- guarded-sweep mode ---
+# When NIBLET_GUARDED_APPLY=1, scans proposals dir and auto-promotes any
+# MERGE_KB_ENTRY or UPDATE_KB_ENTRY proposal that has risk=low, confidence=high,
+# scope=project, and no rejected_reason.  For UPDATE_KB_ENTRY, a timestamped
+# backup is written before overwriting.
+if [ "${1:-}" = "--guarded-sweep" ]; then
+  shift
+  _gs_root=""
+  if [ "${1:-}" = "--project-root" ]; then
+    _gs_root="$2"; shift 2
+  fi
+  [ -n "$_gs_root" ] || _gs_root="$(niblet_project_root "$PWD")"
+
+  if [ "${NIBLET_GUARDED_APPLY:-0}" != "1" ]; then
+    echo "guarded-sweep: NIBLET_GUARDED_APPLY not enabled; skipping"
+    exit 0
+  fi
+
+  _gs_prop_dir="$(niblet_store "$_gs_root")/proposals"
+
+  _gs_field() {
+    local key="$1" file="$2"
+    awk -v K="$key" '
+      /^---$/ { c++; next }
+      c == 1 {
+        if (match($0, "^"K"[[:space:]]*:[[:space:]]*")) {
+          v = substr($0, RLENGTH + 1)
+          sub(/[[:space:]]+$/, "", v)
+          print v
+          exit
+        }
+      }
+      c >= 2 { exit }
+    ' "$file"
+  }
+
+  _gs_count=0
+  if [ -d "$_gs_prop_dir" ]; then
+    for _gs_p in "$_gs_prop_dir"/*.md; do
+      [ -f "$_gs_p" ] || continue
+      _gs_act="$(_gs_field action     "$_gs_p")"
+      _gs_sc="$( _gs_field scope      "$_gs_p")"
+      _gs_ri="$( _gs_field risk       "$_gs_p")"
+      _gs_co="$( _gs_field confidence "$_gs_p")"
+      case "$_gs_act" in MERGE_KB_ENTRY|UPDATE_KB_ENTRY) ;; *) continue ;; esac
+      [ "$_gs_sc" = "project" ]   || continue
+      [ "$_gs_ri" = "low" ]       || continue
+      [ "$_gs_co" = "high" ]      || continue
+      # Reject if rejected_reason field is present with ANY value (including empty).
+      # An injected empty rejected_reason: line can override a later real rejection
+      # when the awk first-match rule is exploited via a multi-line ACTION value.
+      # Note: exit inside awk body triggers END; use END{exit !found} to preserve
+      # the found/not-found distinction across the END block.
+      awk '/^---$/{c++;next} c==1{if(match($0,"^rejected_reason[[:space:]]*:")){found=1;exit}} c>=2{exit} END{exit !found}' \
+        "$_gs_p" 2>/dev/null && continue || true
+      if [ "$_gs_act" = "UPDATE_KB_ENTRY" ] || [ "$_gs_act" = "MERGE_KB_ENTRY" ]; then
+        _gs_tgt="$(_gs_field target "$_gs_p")"
+        _gs_kb="$(niblet_artifact_dir kb project "$_gs_root")"
+        if [ -n "$_gs_tgt" ] && [ -f "$_gs_tgt" ] && \
+           niblet_assert_under_dir "$_gs_tgt" "$_gs_kb" 2>/dev/null; then
+          _gs_ts="$(date -u +%Y%m%dT%H%M%SZ)"
+          cp "$_gs_tgt" "${_gs_tgt}.niblet-backup.${_gs_ts}"
+        fi
+      fi
+      ( cd "$_gs_root" && "$SCRIPT_DIR/niblet-promote" "$_gs_p" ) \
+        && _gs_count=$((_gs_count+1)) || true
+    done
+  fi
+  printf 'guarded-sweep: auto-promoted %d proposal(s)\n' "$_gs_count"
+  exit 0
+fi
+
 PROPOSAL="$1"
-[ -n "$PROPOSAL" ] || { echo "usage: niblet-promote <proposal-file>" >&2; exit 64; }
+[ -n "$PROPOSAL" ] || { echo "usage: niblet-promote <proposal-file> | --guarded-sweep [--project-root <path>]" >&2; exit 64; }
 [ -f "$PROPOSAL" ] || { echo "no such file: $PROPOSAL" >&2; exit 65; }
 
 # Parse the YAML-ish envelope at the top.
@@ -52,11 +133,29 @@ envelope_field() {
   ' "$PROPOSAL"
 }
 
-# Extract payload (everything after the second --- separator).
+# Extract payload (everything after the second --- separator, minus any
+# <!-- NIBLET BEGINNER SUMMARY -->...<!-- END NIBLET BEGINNER SUMMARY -->
+# block that niblet-apply injects for human-readable context only).
+# The block is stripped ONLY when the envelope has has_beginner_summary:true,
+# to avoid corrupting legitimate artifacts that contain those marker strings.
 extract_payload() {
-  awk '
+  local _strip_bsum
+  _strip_bsum="$(envelope_field has_beginner_summary)"
+  awk -v strip_bsum="$_strip_bsum" '
     /^---$/ { c++; if (c == 2) { in_body = 1; next } }
-    in_body { print }
+    in_body {
+      if (strip_bsum == "true" && !stripped_bsum && /^<!-- NIBLET BEGINNER SUMMARY -->$/) { skip = 1; held = ""; next }
+      if (skip && /^<!-- END NIBLET BEGINNER SUMMARY -->$/) { skip = 0; stripped_bsum = 1; eat_blank = 1; next }
+      if (skip) next
+      if (eat_blank) {
+        eat_blank = 0
+        if (/^[[:space:]]*$/) next
+      }
+      if (/^[[:space:]]*$/) { held = held $0 "\n"; next }
+      if (held != "") { printf "%s", held; held = "" }
+      print
+    }
+    END { if (held != "") printf "%s", held }
   ' "$PROPOSAL"
 }
 
@@ -66,6 +165,16 @@ TARGET="$(envelope_field target)"
 SECTION="$(envelope_field section)"
 
 [ -n "$ACTION" ] || { echo "proposal missing 'action' field" >&2; exit 65; }
+
+# Actions with no target and no write — just mark the proposal as reviewed.
+case "$ACTION" in
+  OPEN_QUESTION|AUDIT_REPORT)
+    echo "promoted: $ACTION (reviewed, no write)"
+    rm -f "$PROPOSAL"
+    exit 0
+    ;;
+esac
+
 [ -n "$TARGET" ] || { echo "proposal missing 'target' field" >&2; exit 65; }
 
 # Hard-clamp the target for UPDATE_CLAUDE — it can only ever be the project's
@@ -90,26 +199,23 @@ fi
 # Map action → artifact kind that niblet_artifact_dir understands.
 artifact_kind_for_action() {
   case "$1" in
-    CREATE_SKILL)   echo "skills"   ;;
-    CREATE_COMMAND) echo "commands" ;;
-    ADD_KB_ENTRY)   echo "kb"       ;;
-    UPDATE_MEMORY)  echo "memory"   ;;
-    *)              echo ""         ;;
+    CREATE_SKILL|UPDATE_SKILL)                              echo "skills"   ;;
+    CREATE_COMMAND|UPDATE_COMMAND)                          echo "commands" ;;
+    CREATE_AGENT|UPDATE_AGENT)                              echo "agents"   ;;
+    CREATE_SCRIPT|UPDATE_SCRIPT)                            echo "scripts"  ;;
+    ADD_KB_ENTRY|MERGE_KB_ENTRY|UPDATE_KB_ENTRY|DEPRECATE_KB_ENTRY) echo "kb" ;;
+    UPDATE_MEMORY)                                          echo "memory"   ;;
+    *)                                                      echo ""         ;;
   esac
 }
 
 # Decide the allowed root for containment.
-#
-# For ADD_KB_ENTRY / UPDATE_MEMORY / CREATE_SKILL / CREATE_COMMAND we ask
-# `niblet_artifact_dir` (which already knows about Claude `.claude/` vs
-# Kimi `.kimi/`) for the per-kind/scope root. For UPDATE_CLAUDE the
-# allowed root is the project root itself (CLAUDE.md lives directly under
-# it). Runtime-home lookups go through `niblet_runtime_home`, never the
-# non-existent helper that an earlier draft of this file called.
 allowed_root() {
   local pr; pr="$(niblet_project_root "$PWD")"
   case "$ACTION" in
-    CREATE_SKILL|CREATE_COMMAND|ADD_KB_ENTRY|UPDATE_MEMORY)
+    CREATE_SKILL|CREATE_COMMAND|ADD_KB_ENTRY|UPDATE_MEMORY|\
+    CREATE_AGENT|CREATE_SCRIPT|MERGE_KB_ENTRY|UPDATE_KB_ENTRY|\
+    DEPRECATE_KB_ENTRY|UPDATE_SKILL|UPDATE_AGENT|UPDATE_COMMAND|UPDATE_SCRIPT)
       local kind; kind="$(artifact_kind_for_action "$ACTION")"
       niblet_artifact_dir "$kind" "$SCOPE" "$pr"
       ;;
@@ -143,10 +249,80 @@ if ! niblet_assert_no_symlink_in_path "$TARGET" "$ROOT" 2>/dev/null; then
 fi
 
 case "$ACTION" in
-  ADD_KB_ENTRY|UPDATE_MEMORY|CREATE_SKILL|CREATE_COMMAND)
+  ADD_KB_ENTRY|UPDATE_MEMORY|CREATE_SKILL|CREATE_COMMAND|CREATE_AGENT)
     mkdir -p "$(dirname "$TARGET")"
     extract_payload > "$TARGET"
     echo "promoted: $ACTION -> $TARGET"
+    rm -f "$PROPOSAL"
+    ;;
+
+  CREATE_SCRIPT)
+    # Re-validate syntax before writing. Never set executable bit.
+    _tmp_script="$(mktemp)"
+    extract_payload > "$_tmp_script"
+    _val_result="pass"
+    case "$TARGET" in
+      *.py) python3 -m py_compile "$_tmp_script" 2>/dev/null || _val_result="fail" ;;
+      *)    bash -n "$_tmp_script" 2>/dev/null || _val_result="fail" ;;
+    esac
+    if [ "$_val_result" = "fail" ]; then
+      rm -f "$_tmp_script"
+      echo "script validation failed: refusing to promote $TARGET" >&2
+      exit 65
+    fi
+    mkdir -p "$(dirname "$TARGET")"
+    cat "$_tmp_script" > "$TARGET"
+    rm -f "$_tmp_script"
+    chmod a-x "$TARGET" 2>/dev/null || true
+    echo "promoted: $ACTION -> $TARGET"
+    rm -f "$PROPOSAL"
+    ;;
+
+  UPDATE_SKILL|UPDATE_AGENT|UPDATE_COMMAND)
+    mkdir -p "$(dirname "$TARGET")"
+    [ -f "$TARGET" ] && cp "$TARGET" "${TARGET}.niblet-backup"
+    extract_payload > "$TARGET"
+    echo "promoted: $ACTION -> $TARGET"
+    rm -f "$PROPOSAL"
+    ;;
+
+  UPDATE_SCRIPT)
+    # Re-validate syntax and clear executable bit, same safety model as CREATE_SCRIPT.
+    _tmp_script="$(mktemp)"
+    extract_payload > "$_tmp_script"
+    _val_result="pass"
+    case "$TARGET" in
+      *.py) python3 -m py_compile "$_tmp_script" 2>/dev/null || _val_result="fail" ;;
+      *)    bash -n "$_tmp_script" 2>/dev/null || _val_result="fail" ;;
+    esac
+    if [ "$_val_result" = "fail" ]; then
+      rm -f "$_tmp_script"
+      echo "script validation failed: refusing to promote $TARGET" >&2
+      exit 65
+    fi
+    mkdir -p "$(dirname "$TARGET")"
+    [ -f "$TARGET" ] && cp "$TARGET" "${TARGET}.niblet-backup"
+    cat "$_tmp_script" > "$TARGET"
+    rm -f "$_tmp_script"
+    chmod a-x "$TARGET" 2>/dev/null || true
+    echo "promoted: $ACTION -> $TARGET"
+    rm -f "$PROPOSAL"
+    ;;
+
+  MERGE_KB_ENTRY|UPDATE_KB_ENTRY)
+    mkdir -p "$(dirname "$TARGET")"
+    extract_payload > "$TARGET"
+    echo "promoted: $ACTION -> $TARGET"
+    rm -f "$PROPOSAL"
+    ;;
+
+  DEPRECATE_KB_ENTRY)
+    if [ -f "$TARGET" ]; then
+      mv "$TARGET" "${TARGET}.deprecated"
+      echo "promoted: $ACTION -> ${TARGET}.deprecated (renamed)"
+    else
+      echo "promoted: $ACTION -> $TARGET (no file to rename)"
+    fi
     rm -f "$PROPOSAL"
     ;;
 

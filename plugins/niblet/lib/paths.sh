@@ -40,7 +40,7 @@ niblet_runtime_home() {
 # Path for an artifact category, given scope and project root.
 #
 # Usage: niblet_artifact_dir <kind> <scope> <project_root>
-#   kind  ∈ {kb, skills, commands, memory}
+#   kind  ∈ {kb, skills, commands, agents, scripts, memory}
 #   scope ∈ {project, global}
 niblet_artifact_dir() {
   local kind="$1" scope="$2" project_root="$3"
@@ -57,6 +57,8 @@ niblet_artifact_dir() {
       kb)        echo "$rt_home/kb" ;;
       skills)    echo "$rt_home/skills/niblet" ;;
       commands)  echo "$rt_home/commands/niblet" ;;
+      agents)    echo "$rt_home/agents/niblet" ;;
+      scripts)   echo "$rt_home/scripts/niblet" ;;
       memory)    echo "$rt_home/memory" ;;
       *)         echo "$rt_home/$kind" ;;
     esac
@@ -65,6 +67,8 @@ niblet_artifact_dir() {
       kb)        echo "$project_root/$base_subdir/kb" ;;
       skills)    echo "$project_root/$base_subdir/skills/niblet" ;;
       commands)  echo "$project_root/$base_subdir/commands/niblet" ;;
+      agents)    echo "$project_root/$base_subdir/agents/niblet" ;;
+      scripts)   echo "$project_root/$base_subdir/scripts/niblet" ;;
       memory)    echo "$project_root/$base_subdir/memory" ;;
       *)         echo "$project_root/$base_subdir/$kind" ;;
     esac

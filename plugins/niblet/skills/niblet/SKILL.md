@@ -20,7 +20,32 @@ reminder appears.
 | Tier | What gets written | Where |
 |---|---|---|
 | **Auto-write** (safe, local, reversible) | KB entries (project), feedback memory (project) | `<project>/.claude/kb/`, `<project>/.claude/memory/` |
-| **Proposal** (needs user promotion) | Skills, commands, CLAUDE.md edits, any `scope=global` | `<project>/.niblet/proposals/` or `~/.niblet-proposals/` |
+| **Proposal** (needs user promotion) | Skills, agents, scripts, commands, CLAUDE.md edits, any `scope=global` | `<project>/.niblet/proposals/` or `~/.niblet-proposals/` |
+
+### Action types and their routing
+
+| Action | Scope | Routing |
+|---|---|---|
+| `ADD_KB_ENTRY` | project | **auto-write** → `<project>/.claude/kb/<topic>.md` |
+| `MERGE_KB_ENTRY` | project | **auto-write** → merged into `<project>/.claude/kb/<topic>.md` |
+| `UPDATE_KB_ENTRY` | project | **auto-write** → overwrites `<project>/.claude/kb/<topic>.md` |
+| `DEPRECATE_KB_ENTRY` | project | **auto-write** → prepends deprecation notice (tombstone if absent) |
+| `UPDATE_MEMORY` | project | **auto-write** → `<project>/.claude/memory/feedback_<slug>.md` |
+| `CREATE_SKILL` | any | **proposal** |
+| `CREATE_AGENT` | any | **proposal** |
+| `CREATE_SCRIPT` | any | **proposal** (envelope includes bash/python validation result) |
+| `CREATE_COMMAND` | any | **proposal** |
+| `UPDATE_SKILL` | any | **proposal** (backup written before overwrite on promotion) |
+| `UPDATE_AGENT` | any | **proposal** (backup written before overwrite on promotion) |
+| `UPDATE_COMMAND` | any | **proposal** (backup written before overwrite on promotion) |
+| `UPDATE_SCRIPT` | any | **proposal** (backup written before overwrite on promotion) |
+| `UPDATE_CLAUDE` | project | **proposal** |
+| `OPEN_QUESTION` | any | **proposal** (question text for human review) |
+| `AUDIT_REPORT` | any | **proposal** (structured audit findings for human review) |
+| `ADD_KB_ENTRY` | global | **proposal** → `~/.niblet-proposals/` |
+| `UPDATE_MEMORY` | global | **proposal** |
+| unknown action | any | **proposal** with `rejected_reason=unknown-action` |
+| bad slug or path escape | any | **proposal** with `rejected_reason` |
 
 Why proposals: skills and CLAUDE.md affect every future session and are
 checked into git. Auto-writing them would let any text Claude reads
@@ -120,6 +145,107 @@ A previous session has ended. Its raw log is queued for analysis.
    `<project>/.niblet/proposals/` so they can review with
    `niblet-promote` — never raw `mv`. Then respond to their request.
 
+## When you see "NIBLET CHECKPOINT (distill)"
+
+The project KB has grown above the distill threshold (default: 20 files or
+200 000 bytes). Before responding to the user:
+
+1. **Spawn** a `general-purpose` sub-agent via Task tool. Use the prompt
+   verbatim from the reminder — it names the **KB directory**, memory
+   directory, digests directory, and project root.
+
+2. **Wait** for output between sentinels — same format as DEEP:
+   ```
+   <<<NIBLET ACTIONS BEGIN>>>
+   {"action":"...", ...}
+   <<<NIBLET ACTIONS END>>>
+   ```
+
+3. **Stage each ACTION JSON via Write, then pipe via stdin** through
+   `niblet-apply`:
+   - `MERGE_KB_ENTRY`, `UPDATE_KB_ENTRY`, `DEPRECATE_KB_ENTRY` (project scope)
+     → **auto-write** (no proposal needed)
+   - `CREATE_SKILL`, `CREATE_AGENT`, `CREATE_COMMAND`, any `scope=global`
+     → **proposal** (requires user promotion)
+
+4. **Delete the claimed distill entry** the reminder names.
+
+5. **Tell the user briefly** what was merged, deprecated, or proposed.
+   Then respond to their request.
+
+## When you see "NIBLET CHECKPOINT (audit)"
+
+A periodic audit is due. The niblet plugin triggers this after every N sessions
+(default: 5) by writing an entry to `.niblet/audit_queue/`. Before responding
+to the user:
+
+1. **Spawn** a `general-purpose` sub-agent via Task tool. Use the prompt
+   verbatim from the reminder — it names the **artifact index**, KB directory,
+   memory directory, digests directory, and project root.
+
+2. **Wait** for output between sentinels — same format as DEEP:
+   ```
+   <<<NIBLET ACTIONS BEGIN>>>
+   {"action":"...", ...}
+   <<<NIBLET ACTIONS END>>>
+   ```
+
+3. **Stage each ACTION JSON via Write, then pipe via stdin** through
+   `niblet-apply`:
+   - `UPDATE_KB_ENTRY`, `DEPRECATE_KB_ENTRY` (project scope) → **auto-write**
+   - `UPDATE_SKILL`, `UPDATE_AGENT`, `UPDATE_COMMAND` → **proposal**
+   - `AUDIT_REPORT`, `OPEN_QUESTION` → **proposal** (for human review)
+
+4. **Delete the claimed audit entry** the reminder names.
+
+5. **Tell the user briefly** what was updated, deprecated, or proposed.
+   Then respond to their request.
+
+## Reviewing proposals — `niblet-proposal-reviewer`
+
+Before promoting a proposal, you can invoke the proposal-reviewer agent for
+a safety audit. The parent agent (you) spawns it with a prompt listing the
+proposals directory and the project root. The sub-agent returns a structured
+`approve` / `flag` decision per proposal — it never modifies anything.
+
+```bash
+# Optional: review all pending proposals before batch-promoting
+# Use niblet-status to see the count first, then spawn niblet-proposal-reviewer
+# via the Agent/Task tool with the proposals directory path.
+```
+
+The reviewer checks: no secrets in content, one artifact per proposal,
+evidence present for UPDATE_*/DEPRECATE_* actions, path containment, no
+name conflicts, beginner_summary readable. An `approve` result means safe
+to promote; a `flag` result lists the specific checks that failed.
+
+## Configuration reference
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `NIBLET_DEEP_THRESHOLD` | `20` | Safety-net: enqueue DEEP mid-session after this many turns |
+| `NIBLET_KB_DISTILL_COUNT` | `20` | KB file count above which DISTILL is queued (once per session) |
+| `NIBLET_KB_DISTILL_BYTES` | `200000` | KB byte total above which DISTILL is queued |
+| `NIBLET_AUDIT_INTERVAL_SESSIONS` | `5` | Sessions between AUDIT triggers |
+| `NIBLET_GUARDED_APPLY` | unset | When `1`, auto-promotes `risk=low + confidence=high` MERGE/UPDATE_KB_ENTRY without user action |
+| `NIBLET_BEGINNER_UX` | unset | When `1`, embeds `beginner_summary` in proposals; niblet-status uses plain language |
+
+## niblet-status
+
+```bash
+niblet-status <project_root>
+```
+
+Prints a project dashboard without emitting any file content — only counts,
+filenames, and paths:
+
+- KB entry count
+- Memory file count
+- Pending proposals count (with action-type breakdown)
+- Promoted artifacts (by category)
+- distill_queue and audit_queue depth
+- Plain-language "next steps" (non-technical when `NIBLET_BEGINNER_UX=1`)
+
 ## Proposal promotion — `niblet-promote`
 
 When the user has reviewed a proposal and wants to apply it, the canonical
@@ -130,11 +256,19 @@ niblet-promote <proposal-file>
 ```
 
 The helper is action-aware:
-- `CREATE_SKILL` / `CREATE_COMMAND` / `ADD_KB_ENTRY` / `UPDATE_MEMORY` →
+- `CREATE_SKILL` / `CREATE_AGENT` / `CREATE_COMMAND` / `CREATE_SCRIPT` →
   strips the envelope, writes the payload to the target path.
+  `CREATE_SCRIPT` re-validates before writing and never sets executable bit.
+- `ADD_KB_ENTRY` / `UPDATE_MEMORY` / `MERGE_KB_ENTRY` / `UPDATE_KB_ENTRY` →
+  strips the envelope, writes/merges payload to target.
+- `UPDATE_SKILL` / `UPDATE_AGENT` / `UPDATE_COMMAND` / `UPDATE_SCRIPT` →
+  creates a backup at `<target>.niblet-backup` before overwriting.
+- `DEPRECATE_KB_ENTRY` → renames target to `<target>.deprecated`.
 - `UPDATE_CLAUDE` → locates the named `## section` heading in the target
   CLAUDE.md and **appends** the addition under it. Creates the section
   if absent. Never overwrites the file.
+- `OPEN_QUESTION` / `AUDIT_REPORT` → no-op (already in proposals dir;
+  mark as reviewed by removing the file).
 
 Plain `mv` would double-wrap SKILL frontmatter and replace CLAUDE.md
 wholesale — do not document `mv` as a promotion path.

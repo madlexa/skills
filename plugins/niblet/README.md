@@ -94,22 +94,48 @@ Session
   │     Safety net: counter ≥ NIBLET_DEEP_THRESHOLD (default 20) → enqueue
   │
   ├── SessionEnd hook
-  │     on_session_end.sh: write a queue entry to <store>/pending_deep/
-  │     (project-wide; any subsequent session can drain it)
+  │     on_session_end.sh:
+  │       write queue entry to .niblet/pending_deep/    (cross-session DEEP)
+  │       write .niblet/digests/<id>.json               (sanitized: counts only)
+  │       increment .niblet/session_count
+  │       update .niblet/index/artifacts.jsonl           (filenames only)
+  │       if session_count % NIBLET_AUDIT_INTERVAL (default 5) == 0
+  │         → write entry to .niblet/audit_queue/
+  │
+  ├── Distill threshold check (in UserPromptSubmit)
+  │     if KB files > NIBLET_KB_DISTILL_COUNT (default 20) or
+  │        KB bytes > NIBLET_KB_DISTILL_BYTES (default 200000):
+  │       → write entry to .niblet/distill_queue/ (at most once per session)
   │
   ├── FAST checkpoint (agent acts inline)
   │     UserPromptSubmit hook → reminder for THIS session's PENDING_FAST
   │     Agent pipes ACTIONs through bin/niblet-apply (validated, contained)
   │     Auto-write tier: KB entries (project), memory feedback (project)
   │
-  └── DEEP checkpoint (sub-agent extracts, parent routes via helper)
-        UserPromptSubmit hook → reminder draining oldest queue entry,
-        regardless of current session id (cross-session delivery)
-        Agent spawns niblet-deep via Task tool
-        Sub-agent emits JSONL ACTIONs between sentinels
-        Agent pipes each ACTION through bin/niblet-apply
-        Risky ACTIONs (skills, commands, CLAUDE.md, any global) → proposals
-        User promotes via bin/niblet-promote (action-aware) — never raw mv
+  ├── DEEP checkpoint (sub-agent extracts, parent routes via helper)
+  │     UserPromptSubmit hook → reminder draining oldest queue entry,
+  │     regardless of current session id (cross-session delivery)
+  │     Agent spawns niblet-deep via Task tool; reads digest if available
+  │     Sub-agent emits JSONL ACTIONs between sentinels
+  │     Agent pipes each ACTION through bin/niblet-apply
+  │     Risky ACTIONs (skills, agents, scripts, CLAUDE.md, any global)
+  │       → proposals; user promotes via bin/niblet-promote (never raw mv)
+  │
+  ├── DISTILL checkpoint (sub-agent consolidates KB)
+  │     UserPromptSubmit hook → reminder if distill_queue has entries
+  │     Agent spawns niblet-distill via Task tool
+  │     Sub-agent reads KB, memory, digests; identifies duplicates and
+  │     stable multi-session patterns
+  │     MERGE_KB_ENTRY, UPDATE_KB_ENTRY, DEPRECATE_KB_ENTRY → auto-write
+  │     CREATE_SKILL, CREATE_AGENT, CREATE_COMMAND → proposals
+  │
+  └── AUDIT checkpoint (sub-agent scans artifacts)
+        UserPromptSubmit hook → reminder if audit_queue has entries
+        Agent spawns niblet-audit via Task tool
+        Sub-agent reads artifact index, KB, digests; detects stale
+        commands, contradictions, duplicate artifacts
+        UPDATE_KB_ENTRY, DEPRECATE_KB_ENTRY → auto-write
+        UPDATE_SKILL, UPDATE_AGENT, UPDATE_COMMAND, AUDIT_REPORT → proposals
 ```
 
 **Per-session isolation for FAST.** Markers and counters live in
@@ -127,14 +153,25 @@ Two tiers — `niblet-apply` enforces them; the agent does not choose:
 | Action | Scope | Behavior |
 |---|---|---|
 | `ADD_KB_ENTRY` | project | **auto** → `<project>/.claude/kb/<topic>.md` |
+| `MERGE_KB_ENTRY` | project | **auto** → merged into `<project>/.claude/kb/<topic>.md` |
+| `UPDATE_KB_ENTRY` | project | **auto** → overwrites `<project>/.claude/kb/<topic>.md` |
+| `DEPRECATE_KB_ENTRY` | project | **auto** → prepends deprecation notice; tombstone if absent |
 | `UPDATE_MEMORY` | project | **auto** → `<project>/.claude/memory/feedback_<slug>.md` |
 | `CREATE_SKILL` | any | **proposal** → `.niblet/proposals/<ts>-<slug>.md` |
+| `CREATE_AGENT` | any | **proposal** |
+| `CREATE_SCRIPT` | any | **proposal** (envelope includes bash/python validation result) |
 | `CREATE_COMMAND` | any | **proposal** |
+| `UPDATE_SKILL` | any | **proposal** (backup created before overwrite on promotion) |
+| `UPDATE_AGENT` | any | **proposal** (backup created before overwrite on promotion) |
+| `UPDATE_COMMAND` | any | **proposal** (backup created before overwrite on promotion) |
+| `UPDATE_SCRIPT` | any | **proposal** (backup created before overwrite on promotion) |
 | `UPDATE_CLAUDE` | project | **proposal** |
+| `OPEN_QUESTION` | any | **proposal** (question text only; for human review) |
+| `AUDIT_REPORT` | any | **proposal** (structured audit findings; for human review) |
 | `ADD_KB_ENTRY` | global | **proposal** → `~/.niblet-proposals/` |
 | `UPDATE_MEMORY` | global | **proposal** |
-| any action with bad slug | any | **proposal** with `rejected_reason` |
-| any action that escapes its allowed dir | any | **proposal** with `rejected_reason` |
+| unknown action | any | **proposal** with `rejected_reason=unknown-action` |
+| bad slug or path escape | any | **proposal** with `rejected_reason` |
 
 Skills, commands, and CLAUDE.md affect every future session and live in git.
 Auto-writing them would let any text Claude reads (an attacker's README, a
@@ -189,11 +226,17 @@ section is capped at ~40 entries to stay budget-light.
 | `<project>/.claude/kb/` | Project KB (findings) — auto-written | yes |
 | `<project>/.claude/memory/` | Project memory feedback — auto-written | yes |
 | `<project>/.claude/skills/niblet/` | Project skills — promoted from proposals | yes |
+| `<project>/.claude/agents/niblet/` | Project agents — promoted from proposals | yes |
 | `<project>/.claude/commands/niblet/` | Project commands — promoted | yes |
+| `<project>/.claude/scripts/niblet/` | Project scripts — promoted (no executable bit) | yes |
 | `<project>/.niblet/proposals/` | Pending project proposals | gitignored |
 | `<project>/.niblet/raw/` | Per-session sanitized JSONL log | gitignored |
 | `<project>/.niblet/sessions/<id>/` | Per-session FAST marker + counter | gitignored |
 | `<project>/.niblet/pending_deep/` | Project-wide DEEP queue entries | gitignored |
+| `<project>/.niblet/digests/` | Per-session sanitized digest (counts only) | gitignored |
+| `<project>/.niblet/index/` | Artifact index (filenames only) | gitignored |
+| `<project>/.niblet/distill_queue/` | Pending DISTILL entries | gitignored |
+| `<project>/.niblet/audit_queue/` | Pending AUDIT entries | gitignored |
 | `~/.claude/skills/niblet/`, `~/.claude/memory/` | Cross-project artifacts | host home |
 | `~/.niblet-proposals/` | Pending global proposals | host home |
 
@@ -202,6 +245,58 @@ section is capped at ~40 entries to stay budget-light.
 | Variable | Default | Purpose |
 |---|---|---|
 | `NIBLET_DEEP_THRESHOLD` | `20` | Safety-net turns before DEEP enqueues mid-session. Normal DEEP fires on SessionEnd regardless. |
+| `NIBLET_KB_DISTILL_COUNT` | `20` | KB file count above which DISTILL is queued (at most once per session). |
+| `NIBLET_KB_DISTILL_BYTES` | `200000` | KB total bytes above which DISTILL is queued. |
+| `NIBLET_AUDIT_INTERVAL_SESSIONS` | `5` | Sessions between AUDIT triggers (`session_count % N == 0`). |
+| `NIBLET_GUARDED_APPLY` | unset | When `1`, auto-promotes proposals with `risk=low` + `confidence=high` for MERGE/UPDATE_KB_ENTRY without manual `niblet-promote`. All other action types require manual review regardless. |
+| `NIBLET_BEGINNER_UX` | unset | When `1`, embeds `beginner_summary` block in every proposal envelope; `niblet-status` switches to non-technical plain language. |
+
+## niblet-status
+
+```bash
+niblet-status <project_root>
+```
+
+Prints a project dashboard — counts, filenames, and paths only; never file
+content:
+
+```
+niblet status for /path/to/project
+  KB entries:         12
+  Memory files:        3
+  Pending proposals:   2 (CREATE_SKILL x1, OPEN_QUESTION x1)
+  Promoted:           skills x2, agents x1
+  distill_queue:       0
+  audit_queue:         1
+
+Next steps:
+  - Review proposals: .niblet/proposals/
+  - Run 'niblet-promote <file>' to apply a proposal
+  - AUDIT checkpoint pending — will fire at next session start
+```
+
+Pass `NIBLET_BEGINNER_UX=1 niblet-status <project>` for plain-language output.
+
+## Guarded auto-apply (opt-in)
+
+For the lowest-risk operations only, niblet-promote supports an opt-in
+auto-promotion sweep:
+
+```bash
+NIBLET_GUARDED_APPLY=1 niblet-promote --guarded-sweep --project-root <project>
+```
+
+This auto-applies only proposals where **all three** conditions hold:
+
+1. `risk=low` in the proposal envelope
+2. `confidence=high` in the proposal envelope
+3. Action is `MERGE_KB_ENTRY` or `UPDATE_KB_ENTRY` (KB entries only)
+
+Skills, agents, scripts, commands, CLAUDE.md edits, and any `scope=global`
+proposals are **never** auto-applied. When `NIBLET_GUARDED_APPLY` is unset
+(the default), the sweep is a no-op.
+
+A timestamped backup is written before each auto-applied update.
 
 ## Uninstall
 
@@ -216,49 +311,68 @@ Project-local `.niblet/`, `.claude/kb/`, and any pending proposals are
 
 ```
 niblet/
-├── .claude-plugin/plugin.json     # plugin manifest
-├── skills/niblet/SKILL.md         # how agent reacts to checkpoints
-├── agents/niblet-deep.md          # sub-agent prompt for DEEP layer
+├── .claude-plugin/plugin.json         # plugin manifest
+├── skills/niblet/SKILL.md             # how agent reacts to checkpoints
+├── agents/
+│   ├── niblet-deep.md                 # sub-agent prompt for DEEP layer
+│   ├── niblet-distill.md              # sub-agent prompt for DISTILL layer
+│   ├── niblet-audit.md                # sub-agent prompt for AUDIT layer
+│   └── niblet-proposal-reviewer.md   # safety reviewer for proposals
 ├── hooks/
-│   ├── hooks.json                 # hook registration
-│   ├── observe.sh                 # PreToolUse/PostToolUse — sanitized logger
-│   ├── on_stop.sh                 # PENDING_FAST + counter + safety net
-│   ├── on_session_end.sh          # write project DEEP queue entry
-│   ├── on_session_start.sh        # emit KB index reminder
-│   └── on_prompt_submit.sh        # drain queue / inject FAST reminder
+│   ├── hooks.json                     # hook registration
+│   ├── observe.sh                     # PreToolUse/PostToolUse — sanitized logger
+│   ├── on_stop.sh                     # PENDING_FAST + counter + safety net
+│   ├── on_session_end.sh              # DEEP queue, digest, session_count, audit trigger
+│   ├── on_session_start.sh            # emit KB index reminder
+│   └── on_prompt_submit.sh            # drain queues / inject checkpoint reminders
 ├── bin/
-│   ├── niblet-apply               # single secure write entry point
-│   └── niblet-promote             # action-aware proposal promotion
+│   ├── niblet-apply                   # single secure write entry point
+│   ├── niblet-promote                 # action-aware proposal promotion
+│   └── niblet-status                  # project dashboard (counts + paths only)
 ├── lib/
-│   ├── paths.sh                   # runtime + project root + artifact dirs
-│   ├── gitignore.sh               # idempotent .gitignore add
-│   ├── jsonl.sh                   # JSONL helpers
-│   ├── sanitize.sh                # safe path + slug + containment helpers
-│   └── store.sh                   # ensure store + gitignore
-└── tests/smoke_test.sh            # 33-check contract test suite
+│   ├── paths.sh                       # runtime + project root + artifact dirs
+│   ├── gitignore.sh                   # idempotent .gitignore add
+│   ├── jsonl.sh                       # JSONL helpers
+│   ├── sanitize.sh                    # safe path + slug + containment helpers
+│   ├── store.sh                       # ensure store + gitignore
+│   └── digest.sh                      # sanitized session digest writer
+└── tests/smoke_test.sh                # contract test suite (~149 assertions)
 ```
 
 ## Status
 
-**v0.2.0** — addresses four pre-release blockers identified in security
-review:
+**v0.3.0** — autonomous learning layer. Builds on v0.2.0's security
+foundations with five new subsystems:
 
-- **Cross-session DEEP delivery.** DEEP markers moved from per-session dirs
-  (orphaned across sessions) to a project-wide queue at
-  `.niblet/pending_deep/`. The next session drains the queue regardless
-  of session id.
-- **Path-traversal-safe writes.** `bin/niblet-apply` is the single
-  entry point for ACTION writes; it enforces strict slug regex on
-  user-supplied filenames and canonical containment on resolved targets.
-  Anything outside the allowed dir lands as a proposal with
-  `rejected_reason`.
-- **Action-aware promotion.** `bin/niblet-promote` strips proposal
-  envelopes correctly for new-file actions, and **appends** under the
-  named section for `UPDATE_CLAUDE` (never overwrites).
-- **Honest KB visibility.** SessionStart hook emits a compact KB index
-  reminder so the agent sees what `.claude/kb/` already contains. README
-  no longer promises auto-content loading that Claude Code doesn't do.
+- **Session digest layer.** At SessionEnd, niblet writes a sanitized
+  digest per session (`.niblet/digests/`) with file counts, turn count,
+  and failed-command count — never raw tool content or secrets.
+  Session count tracked at `.niblet/session_count`.
 
-33 contract-level smoke tests pass, including security regression checks
-against path traversal, secret leakage, frontmatter double-wrapping, and
-CLAUDE.md overwrite.
+- **10 new action types.** `niblet-apply` now handles CREATE_AGENT,
+  CREATE_SCRIPT, UPDATE_SKILL/AGENT/COMMAND/SCRIPT, MERGE_KB_ENTRY,
+  UPDATE_KB_ENTRY, DEPRECATE_KB_ENTRY, OPEN_QUESTION, and AUDIT_REPORT.
+  Unknown actions land as proposals with `rejected_reason` instead of
+  hard-rejecting.
+
+- **DISTILL checkpoint.** When the KB grows above the distill threshold
+  (default: 20 files or 200 KB), niblet queues a distill entry.
+  The `niblet-distill` sub-agent consolidates duplicates, surfaces stable
+  patterns, and proposes KB cleanup — auto-writing safe operations,
+  proposing higher-impact ones.
+
+- **AUDIT checkpoint.** Every N sessions (default: 5), niblet queues an
+  audit entry. The `niblet-audit` sub-agent scans the artifact index,
+  detects stale paths and KB contradictions, and emits update proposals.
+
+- **niblet-status.** Project dashboard: KB and memory counts, pending
+  proposal breakdown, promoted artifact inventory, queue depth, and
+  plain-language "next steps". Never emits file content.
+
+- **Guarded auto-apply (opt-in).** When `NIBLET_GUARDED_APPLY=1`,
+  `niblet-promote --guarded-sweep` auto-applies `risk=low + confidence=high`
+  MERGE/UPDATE_KB_ENTRY proposals. All other action types remain manual.
+
+~149 contract assertions pass, including security regression checks
+against path traversal, secret leakage, frontmatter double-wrapping,
+CLAUDE.md overwrite, and guarded-apply scope enforcement.

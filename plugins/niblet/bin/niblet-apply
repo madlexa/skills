@@ -70,6 +70,13 @@ SECTION="$(printf '%s' "$JSON" | jq -r '.section // empty')"
 ADDITION="$(printf '%s' "$JSON" | jq -r '.addition // empty')"
 CONTENT="$( printf '%s' "$JSON" | jq -r '.content  // empty')"
 REASON="$(  printf '%s' "$JSON" | jq -r '.reason   // empty')"
+CONFIDENCE="$(       printf '%s' "$JSON" | jq -r '.confidence        // empty')"
+RISK="$(             printf '%s' "$JSON" | jq -r '.risk              // empty')"
+SOURCE_SESSIONS="$(  printf '%s' "$JSON" | jq -r '.source_sessions   // empty')"
+SOURCE_KB="$(        printf '%s' "$JSON" | jq -r '.source_kb         // empty')"
+BEGINNER_SUMMARY="$( printf '%s' "$JSON" | jq -r '.beginner_summary  // empty')"
+VALIDATION_DETAILS="$(printf '%s' "$JSON" | jq -r '.validation_details // empty')"
+EVIDENCE="$(        printf '%s' "$JSON" | jq -r '.evidence          // empty')"
 
 [ -n "$ACTION" ] || { echo "rejected: no action field" >&2; exit 65; }
 case "$SCOPE" in project|global) ;; *) echo "rejected: scope must be project|global" >&2; exit 65 ;; esac
@@ -91,6 +98,11 @@ niblet_ensure_store "$PROJECT_ROOT" >/dev/null
 
 ts() { date -u +%Y%m%dT%H%M%SZ; }
 
+# Sanitize a scalar value for use in a frontmatter field: take only the first
+# line (strip from first newline) and remove bare CR. Prevents multi-line
+# values from injecting extra frontmatter fields into proposal envelopes.
+_fe() { local _v="${1%%$'\n'*}"; printf '%s' "${_v%$'\r'}"; }
+
 write_proposal() {
   local target_dir="$1" reason="$2" target_path="$3"
   mkdir -p "$target_dir" 2>/dev/null
@@ -111,33 +123,79 @@ write_proposal() {
     | LC_ALL=C cut -c -32)"
   [ -z "$slug" ] && slug="unnamed"
 
-  local base="$(ts)-${ACTION}-${slug}"
-  # Avoid silently overwriting an earlier proposal in the same second
-  # (UPDATE_CLAUDE batches with no NAME/TOPIC/FILE are the common case).
+  # Strip path separators from ACTION so a malicious unknown action like
+  # "../../escape" cannot make proposal_path resolve outside target_dir.
+  # Known actions contain only [A-Z_] so stripping "/" leaves them unchanged.
+  local safe_action
+  safe_action="$(printf '%s' "${ACTION%%$'\n'*}" | LC_ALL=C tr -d '\r/' | LC_ALL=C cut -c -32)"
+  [ -z "$safe_action" ] && safe_action="unknown"
+
+  local base="$(ts)-${safe_action}-${slug}"
   local proposal_path="$target_dir/${base}.md"
   local i=1
-  while [ -e "$proposal_path" ]; do
-    i=$((i + 1))
-    proposal_path="$target_dir/${base}-${i}.md"
-  done
+  # Write content to a temp file first, then atomically claim an available
+  # name via mv -n. This eliminates the TOCTOU race between the collision
+  # check and the write when two concurrent niblet-apply calls produce the
+  # same base name in the same second.
+  local _tmp_prop
+  _tmp_prop="$(mktemp "$target_dir/XXXXXXXX.tmp" 2>/dev/null)" || _tmp_prop="$target_dir/.tmp-$$-$(ts)"
   {
     echo "---"
-    echo "action: $ACTION"
-    echo "scope: $SCOPE"
-    [ -n "$target_path" ] && echo "target: $target_path"
-    [ -n "$reason" ]      && echo "rejected_reason: $reason"
+    echo "action: $(_fe "$ACTION")"
+    echo "scope: $(_fe "$SCOPE")"
+    [ -n "$target_path" ] && echo "target: $(_fe "$target_path")"
+    [ -n "$reason" ]      && echo "rejected_reason: $(_fe "$reason")"
     echo "created: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    [ -n "$NAME" ]    && echo "name: $NAME"
-    [ -n "$TOPIC" ]   && echo "topic: $TOPIC"
-    [ -n "$FILE" ]    && echo "file: $FILE"
-    [ -n "$SECTION" ] && echo "section: $SECTION"
+    [ -n "$NAME" ]             && echo "name: $(_fe "$NAME")"
+    [ -n "$TOPIC" ]            && echo "topic: $(_fe "$TOPIC")"
+    [ -n "$FILE" ]             && echo "file: $(_fe "$FILE")"
+    [ -n "$SECTION" ]          && echo "section: $(_fe "$SECTION")"
+    [ -n "$CONFIDENCE" ]       && echo "confidence: $(_fe "$CONFIDENCE")"
+    [ -n "$REASON" ]           && echo "reason: $(_fe "$REASON")"
+    [ -n "$EVIDENCE" ]         && echo "evidence: $(_fe "$EVIDENCE")"
+    [ -n "$RISK" ]             && echo "risk: $(_fe "$RISK")"
+    [ -n "$SOURCE_SESSIONS" ]  && echo "source_sessions: $(_fe "$SOURCE_SESSIONS")"
+    [ -n "$SOURCE_KB" ]        && echo "source_kb: $(_fe "$SOURCE_KB")"
+    [ -n "$VALIDATION_DETAILS" ] && echo "validation: $(_fe "$VALIDATION_DETAILS")"
+    if [ "${NIBLET_BEGINNER_UX:-0}" = "1" ] && [ -n "$BEGINNER_SUMMARY" ]; then
+      echo "has_beginner_summary: true"
+    fi
     echo "---"
+    if [ "${NIBLET_BEGINNER_UX:-0}" = "1" ] && [ -n "$BEGINNER_SUMMARY" ]; then
+      # Strip marker strings so summary content cannot close the skip block early
+      # and have text promoted as artifact content (injection via end-marker escape).
+      _safe_bsum="$(printf '%s' "$BEGINNER_SUMMARY" \
+        | grep -vF '<!-- NIBLET BEGINNER SUMMARY -->' \
+        | grep -vF '<!-- END NIBLET BEGINNER SUMMARY -->' \
+        || true)"
+      printf '\n<!-- NIBLET BEGINNER SUMMARY -->\n%s\n<!-- END NIBLET BEGINNER SUMMARY -->\n\n' "$_safe_bsum"
+    fi
     if [ "$ACTION" = "UPDATE_CLAUDE" ]; then
       printf '%s\n' "$ADDITION"
     else
       printf '%s\n' "$CONTENT"
     fi
-  } > "$proposal_path"
+  } > "$_tmp_prop"
+  local _mv_tries=0
+  local _linked=0
+  while [ "$_mv_tries" -lt 50 ]; do
+    # ln uses link() which is POSIX-atomic: fails with EEXIST if target
+    # already exists, eliminating the TOCTOU race that mv -n cannot prevent
+    # portably on BSD/macOS. Both paths are in $target_dir so same fs.
+    if ln "$_tmp_prop" "$proposal_path" 2>/dev/null; then
+      rm -f "$_tmp_prop" 2>/dev/null || true
+      _linked=1
+      break
+    fi
+    i=$((i + 1))
+    proposal_path="$target_dir/${base}-${i}.md"
+    _mv_tries=$((_mv_tries + 1))
+  done
+  if [ "$_linked" = "0" ]; then
+    echo "error: write_proposal: failed to claim a proposal path after 50 attempts" >&2
+    rm -f "$_tmp_prop" 2>/dev/null || true
+    exit 1
+  fi
   echo "proposal: $ACTION -> $proposal_path"
   exit 0
 }
@@ -206,6 +264,132 @@ case "$ACTION" in
     write_proposal "$target_dir" "" "$target"
     ;;
 
+  CREATE_AGENT)
+    niblet_validate_slug "$NAME" || proposal "invalid-slug:name=$NAME"
+    base="$(niblet_artifact_dir agents "$SCOPE" "$PROJECT_ROOT")"
+    target="$base/$NAME.md"
+    niblet_assert_under_dir "$target" "$base" 2>/dev/null || proposal "path-escape:name=$NAME"
+    target_dir="$PROPOSALS_DIR_PROJECT"
+    [ "$SCOPE" = "global" ] && target_dir="$PROPOSALS_DIR_GLOBAL"
+    write_proposal "$target_dir" "" "$target"
+    ;;
+
+  CREATE_SCRIPT)
+    niblet_validate_slug "$NAME" || proposal "invalid-slug:name=$NAME"
+    base="$(niblet_artifact_dir scripts "$SCOPE" "$PROJECT_ROOT")"
+    target="$base/$NAME"
+    niblet_assert_under_dir "$target" "$base" 2>/dev/null || proposal "path-escape:name=$NAME"
+    # Validate the script content syntax before staging as proposal.
+    _tmp_script="$(mktemp)"
+    printf '%s\n' "$CONTENT" > "$_tmp_script"
+    _val_result="fail"
+    _val_msg=""
+    case "$NAME" in
+      *.py)
+        if python3 -m py_compile "$_tmp_script" 2>/dev/null; then
+          _val_result="pass"
+        else
+          _val_msg="$(python3 -m py_compile "$_tmp_script" 2>&1 || true)"
+        fi
+        ;;
+      *)
+        if bash -n "$_tmp_script" 2>/dev/null; then
+          _val_result="pass"
+        else
+          _val_msg="$(bash -n "$_tmp_script" 2>&1 || true)"
+        fi
+        ;;
+    esac
+    rm -f "$_tmp_script"
+    VALIDATION_DETAILS="${_val_result}${_val_msg:+: ${_val_msg}}"
+    target_dir="$PROPOSALS_DIR_PROJECT"
+    [ "$SCOPE" = "global" ] && target_dir="$PROPOSALS_DIR_GLOBAL"
+    write_proposal "$target_dir" "" "$target"
+    ;;
+
+  UPDATE_SKILL|UPDATE_AGENT|UPDATE_COMMAND|UPDATE_SCRIPT)
+    niblet_validate_slug "$NAME" || proposal "invalid-slug:name=$NAME"
+    case "$ACTION" in
+      UPDATE_SKILL)   base="$(niblet_artifact_dir skills   "$SCOPE" "$PROJECT_ROOT")" ;;
+      UPDATE_AGENT)   base="$(niblet_artifact_dir agents   "$SCOPE" "$PROJECT_ROOT")" ;;
+      UPDATE_COMMAND) base="$(niblet_artifact_dir commands "$SCOPE" "$PROJECT_ROOT")" ;;
+      UPDATE_SCRIPT)  base="$(niblet_artifact_dir scripts  "$SCOPE" "$PROJECT_ROOT")" ;;
+    esac
+    case "$ACTION" in
+      UPDATE_SKILL)   target="$base/$NAME/SKILL.md" ;;
+      UPDATE_AGENT)   target="$base/$NAME.md" ;;
+      UPDATE_COMMAND) target="$base/$NAME.md" ;;
+      UPDATE_SCRIPT)  target="$base/$NAME" ;;
+    esac
+    niblet_assert_under_dir "$target" "$base" 2>/dev/null || proposal "path-escape:name=$NAME"
+    if [ "$ACTION" = "UPDATE_SCRIPT" ]; then
+      _tmp_script="$(mktemp)"
+      printf '%s\n' "$CONTENT" > "$_tmp_script"
+      _val_result="fail"
+      _val_msg=""
+      case "$NAME" in
+        *.py)
+          if python3 -m py_compile "$_tmp_script" 2>/dev/null; then
+            _val_result="pass"
+          else
+            _val_msg="$(python3 -m py_compile "$_tmp_script" 2>&1 || true)"
+          fi
+          ;;
+        *)
+          if bash -n "$_tmp_script" 2>/dev/null; then
+            _val_result="pass"
+          else
+            _val_msg="$(bash -n "$_tmp_script" 2>&1 || true)"
+          fi
+          ;;
+      esac
+      rm -f "$_tmp_script"
+      VALIDATION_DETAILS="${_val_result}${_val_msg:+: ${_val_msg}}"
+    fi
+    target_dir="$PROPOSALS_DIR_PROJECT"
+    [ "$SCOPE" = "global" ] && target_dir="$PROPOSALS_DIR_GLOBAL"
+    write_proposal "$target_dir" "" "$target"
+    ;;
+
+  MERGE_KB_ENTRY|UPDATE_KB_ENTRY)
+    [ "$SCOPE" = "project" ] || proposal "global-kb-needs-review"
+    niblet_validate_slug "$TOPIC" || proposal "invalid-slug:topic=$TOPIC"
+    KB="$(niblet_artifact_dir kb project "$PROJECT_ROOT")"
+    target="$KB/$TOPIC"
+    case "$target" in *.md) ;; *) target="$target.md" ;; esac
+    niblet_assert_under_dir "$target" "$KB" 2>/dev/null || proposal "path-escape:topic=$TOPIC"
+    write_auto "$target" "$KB"
+    ;;
+
+  DEPRECATE_KB_ENTRY)
+    [ "$SCOPE" = "project" ] || proposal "global-kb-needs-review"
+    niblet_validate_slug "$TOPIC" || proposal "invalid-slug:topic=$TOPIC"
+    KB="$(niblet_artifact_dir kb project "$PROJECT_ROOT")"
+    target="$KB/$TOPIC"
+    case "$target" in *.md) ;; *) target="$target.md" ;; esac
+    niblet_assert_under_dir "$target" "$KB" 2>/dev/null || proposal "path-escape:topic=$TOPIC"
+    if ! niblet_assert_no_symlink_in_path "$target" "$KB" 2>/dev/null; then
+      proposal "symlink-in-path:target=$target"
+    fi
+    mkdir -p "$(dirname "$target")" 2>/dev/null
+    _dep_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    _dep_tmp="$(mktemp "$KB/.XXXXXXXX.tmp" 2>/dev/null)" || _dep_tmp="$KB/.dep-$$-${_dep_ts}.tmp"
+    if [ -f "$target" ]; then
+      { printf '<!-- DEPRECATED %s -->\n' "$_dep_ts"; cat "$target"; } > "$_dep_tmp" \
+        && mv "$_dep_tmp" "$target" || { rm -f "$_dep_tmp"; false; }
+    else
+      printf '<!-- DEPRECATED %s -->\n%s\n' "$_dep_ts" "${CONTENT:-deprecated}" > "$_dep_tmp" \
+        && mv "$_dep_tmp" "$target" || { rm -f "$_dep_tmp"; false; }
+    fi
+    echo "applied: $ACTION -> $target"
+    ;;
+
+  OPEN_QUESTION|AUDIT_REPORT)
+    target_dir="$PROPOSALS_DIR_PROJECT"
+    [ "$SCOPE" = "global" ] && target_dir="$PROPOSALS_DIR_GLOBAL"
+    write_proposal "$target_dir" "" ""
+    ;;
+
   UPDATE_CLAUDE)
     [ "$SCOPE" = "project" ] || proposal "global-claude-md-not-supported"
     [ -n "$SECTION" ]  || proposal "missing-section"
@@ -215,7 +399,6 @@ case "$ACTION" in
     ;;
 
   *)
-    echo "rejected: unknown action: $ACTION" >&2
-    exit 65
+    proposal "unknown-action"
     ;;
 esac

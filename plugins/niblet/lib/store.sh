@@ -27,7 +27,8 @@ niblet_ensure_store() {
   [ -n "$project_root" ] || return 0
 
   local store; store="$(niblet_store "$project_root")"
-  mkdir -p "$store/raw" "$store/log" "$store/sessions" "$store/inbox" 2>/dev/null
+  mkdir -p "$store/raw" "$store/log" "$store/sessions" "$store/inbox" \
+           "$store/digests" "$store/index" "$store/distill_queue" "$store/audit_queue" 2>/dev/null
 
   # Register .niblet/ with .gitignore only if this looks like a git repo.
   if [ -d "$project_root/.git" ] || \

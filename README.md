@@ -25,7 +25,7 @@ To update later:
 
 ## Plugins
 
-### niblet (v0.2.0)
+### niblet (v0.3.0)
 
 The diligent crumb-keeper for AI coding sessions. After every turn, Niblet
 auto-writes findings to the project knowledge base via a single secure
@@ -33,15 +33,23 @@ helper. At session end, a sub-agent extracts reusable workflow patterns and
 lands them as proposals you review before promoting (via the action-aware
 `niblet-promote` helper — never a raw `mv`).
 
-**Two layers, two trust tiers:**
+**Five checkpoint layers:**
 - **FAST** (every turn) — agent writes findings to `.claude/kb/` and memory
   feedback. Auto-write, local, reversible.
-- **DEEP** (SessionEnd) — sub-agent extracts workflow patterns; everything
-  that could affect future sessions (skills, commands, CLAUDE.md edits, any
-  global write) is staged as a proposal in `.niblet/proposals/`. You promote
-  via the `niblet-promote` helper — it strips the proposal envelope,
-  appends `UPDATE_CLAUDE` additions under the named section instead of
-  overwriting, and containment-checks the target.
+- **DEEP** (SessionEnd) — sub-agent extracts workflow patterns; skills,
+  agents, commands, CLAUDE.md edits, and global writes are staged as
+  proposals in `.niblet/proposals/`. Promote via `niblet-promote`.
+- **DISTILL** (when KB > 20 files or 200 KB) — sub-agent consolidates
+  overlapping KB entries to keep the knowledge base dense and non-redundant.
+- **AUDIT** (every 5 sessions) — sub-agent scans the artifact index for
+  stale paths and contradictions between KB entries.
+- **`niblet-status`** — dashboard showing KB counts, pending proposals,
+  promoted artifacts, and queue depths.
+
+**Opt-in guarded auto-apply** — set `NIBLET_GUARDED_APPLY=1` and run
+`niblet-promote --guarded-sweep` to auto-promote `risk=low + confidence=high`
+`MERGE_KB_ENTRY` / `UPDATE_KB_ENTRY` proposals. A timestamped backup is
+written before each overwrite. All other action types remain manual.
 
 **Sanitized capture** — observe.sh logs only tool name + safe path + exit
 code. `tool_input` and `tool_response` content (where secrets and untrusted

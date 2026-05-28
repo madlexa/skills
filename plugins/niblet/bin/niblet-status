@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# niblet-status — print a summary of niblet's current state for a project.
+#
+# Reports:
+#   - KB entry count (.claude/kb/)
+#   - Memory file count (.claude/memory/)
+#   - Pending proposals count + action-type breakdown (.niblet/proposals/)
+#   - Promoted artifact names (from artifact index .niblet/index/artifacts.jsonl)
+#   - Distill and audit queue depths
+#   - Plain-language "next steps" (non-technical when NIBLET_BEGINNER_UX=1)
+#
+# Never outputs file content — only counts, filenames, and paths.
+#
+# Usage:
+#   niblet-status [--project-root <abs-path>]
+#   niblet-status <abs-path>   (positional, legacy)
+#
+# Exit codes:
+#   0  success
+#   66 project_root not a directory
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+. "$SCRIPT_DIR/../lib/paths.sh"
+
+PROJECT_ROOT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --project-root) PROJECT_ROOT="$2"; shift 2 ;;
+    -*) printf 'unknown option: %s\n' "$1" >&2; exit 64 ;;
+    *) PROJECT_ROOT="$1"; shift ;;
+  esac
+done
+
+[ -n "$PROJECT_ROOT" ] || PROJECT_ROOT="$(niblet_project_root "$PWD")"
+[ -d "$PROJECT_ROOT" ] || { printf 'niblet-status: not a directory: %s\n' "$PROJECT_ROOT" >&2; exit 66; }
+
+STORE="$(niblet_store "$PROJECT_ROOT")"
+KB_DIR="$(niblet_artifact_dir kb project "$PROJECT_ROOT")"
+MEM_DIR="$(niblet_artifact_dir memory project "$PROJECT_ROOT")"
+PROPOSALS_DIR="$STORE/proposals"
+IDX_FILE="$STORE/index/artifacts.jsonl"
+DISTILL_DIR="$STORE/distill_queue"
+AUDIT_DIR="$STORE/audit_queue"
+BEGINNER="${NIBLET_BEGINNER_UX:-0}"
+
+# ---- counts ----
+kb_count=0
+[ -d "$KB_DIR" ] && kb_count="$(find "$KB_DIR" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
+
+mem_count=0
+[ -d "$MEM_DIR" ] && mem_count="$(find "$MEM_DIR" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
+
+proposal_count=0
+[ -d "$PROPOSALS_DIR" ] && proposal_count="$(find "$PROPOSALS_DIR" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
+
+distill_count=0
+[ -d "$DISTILL_DIR" ] && distill_count="$(find "$DISTILL_DIR" -maxdepth 1 -type f -name '*.distill' 2>/dev/null | wc -l | tr -d ' ')"
+
+audit_count=0
+[ -d "$AUDIT_DIR" ] && audit_count="$(find "$AUDIT_DIR" -maxdepth 1 -type f -name '*.audit' 2>/dev/null | wc -l | tr -d ' ')"
+
+session_count=0
+if [ -f "$STORE/session_count" ]; then
+  session_count="$(cat "$STORE/session_count" 2>/dev/null || echo 0)"
+  case "$session_count" in *[!0-9]*) session_count=0 ;; esac
+fi
+
+# ---- print ----
+printf 'niblet status: %s\n' "$PROJECT_ROOT"
+printf '\n'
+printf 'Knowledge base\n'
+printf '  KB entries:     %s\n' "$kb_count"
+printf '  Memory files:   %s\n' "$mem_count"
+
+printf '\n'
+printf 'Pending proposals: %s\n' "$proposal_count"
+if [ "$proposal_count" -gt 0 ] && [ -d "$PROPOSALS_DIR" ]; then
+  # Action-type breakdown (count occurrences of "action: <TYPE>" in envelope).
+  awk '/^---$/{e++; next} e==1 && /^action:/{print $2; e=2}' \
+    "$PROPOSALS_DIR"/*.md 2>/dev/null \
+    | sort | uniq -c | sort -rn \
+    | while read -r cnt atype; do
+        printf '    %-30s %s\n' "$atype" "$cnt"
+      done
+fi
+
+printf '\n'
+printf 'Promoted artifacts\n'
+if [ -f "$IDX_FILE" ] && command -v jq >/dev/null 2>&1; then
+  # Print one line per artifact: kind name
+  jq -r '.kind + "  " + .name' "$IDX_FILE" 2>/dev/null | sort | while read -r line; do
+    printf '  %s\n' "$line"
+  done
+elif [ -f "$IDX_FILE" ]; then
+  # Fallback without jq: extract name values only (no content).
+  grep -o '"name":"[^"]*"' "$IDX_FILE" 2>/dev/null | sed 's/"name":"//;s/"//' \
+    | while read -r name; do printf '  %s\n' "$name"; done
+else
+  printf '  (artifact index not yet written)\n'
+fi
+
+printf '\n'
+printf 'Queue depths\n'
+printf '  distill_queue:  %s\n' "$distill_count"
+printf '  audit_queue:    %s\n' "$audit_count"
+printf '  sessions seen:  %s\n' "$session_count"
+
+printf '\n'
+if [ "$BEGINNER" = "1" ]; then
+  printf 'Next steps\n'
+  if [ "$proposal_count" -gt 0 ]; then
+    printf '  You have %s suggestion(s) waiting for your review.\n' "$proposal_count"
+    printf '  To review: open the files in %s\n' "$PROPOSALS_DIR"
+    printf '  To apply a suggestion: niblet-promote <proposal-file>\n'
+  fi
+  if [ "$distill_count" -gt 0 ]; then
+    printf '  A knowledge-consolidation task is queued (%s entry).\n' "$distill_count"
+    printf '  It will run automatically at the start of the next session.\n'
+  fi
+  if [ "$audit_count" -gt 0 ]; then
+    printf '  A knowledge-audit task is queued (%s entry).\n' "$audit_count"
+    printf '  It will run automatically at the start of the next session.\n'
+  fi
+  if [ "$proposal_count" = "0" ] && [ "$distill_count" = "0" ] && [ "$audit_count" = "0" ]; then
+    printf '  Everything looks up to date. No action required.\n'
+  fi
+else
+  printf 'Next steps\n'
+  if [ "$proposal_count" -gt 0 ]; then
+    printf '  Review proposals in: %s\n' "$PROPOSALS_DIR"
+    printf '  Apply with: niblet-promote <proposal-file>\n'
+  fi
+  if [ "$distill_count" -gt 0 ]; then
+    printf '  Distill checkpoint pending (%s entry). Will emit next session.\n' "$distill_count"
+  fi
+  if [ "$audit_count" -gt 0 ]; then
+    printf '  Audit checkpoint pending (%s entry). Will emit next session.\n' "$audit_count"
+  fi
+  if [ "$proposal_count" = "0" ] && [ "$distill_count" = "0" ] && [ "$audit_count" = "0" ]; then
+    printf '  No pending work.\n'
+  fi
+fi
