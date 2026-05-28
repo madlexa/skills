@@ -39,7 +39,9 @@ lands them as proposals you review before promoting (via the action-aware
 - **DEEP** (SessionEnd) — sub-agent extracts workflow patterns; everything
   that could affect future sessions (skills, commands, CLAUDE.md edits, any
   global write) is staged as a proposal in `.niblet/proposals/`. You promote
-  via `mv`.
+  via the `niblet-promote` helper — it strips the proposal envelope,
+  appends `UPDATE_CLAUDE` additions under the named section instead of
+  overwriting, and containment-checks the target.
 
 **Sanitized capture** — observe.sh logs only tool name + safe path + exit
 code. `tool_input` and `tool_response` content (where secrets and untrusted

@@ -48,14 +48,28 @@ KB_DIR="$(niblet_artifact_dir kb       project "$PROJECT_ROOT")"
 MEM_DIR="$(niblet_artifact_dir memory   project "$PROJECT_ROOT")"
 PROPOSALS_DIR="$STORE/proposals"
 GLOBAL_PROPOSALS_DIR="$HOME/.niblet-proposals"
-PLUGIN_BIN="\${CLAUDE_PLUGIN_ROOT}/bin"
+# Bare command names — Claude Code adds each plugin's bin/ to the Bash tool
+# PATH for hook / MCP / LSP subprocesses, so `niblet-apply` / `niblet-promote`
+# resolve without an absolute path. Avoid printing ${CLAUDE_PLUGIN_ROOT} in
+# reminders: it's an env var guaranteed only inside the plugin sandbox; the
+# agent shouldn't rely on it expanding everywhere.
 
-# Locate the oldest queue entry (FIFO).
+# Atomically claim the oldest queue entry (FIFO) so two parallel new
+# sessions cannot both pick the same DEEP job. We rename `.queue` to
+# `.claimed-<session>` via `mv -n` (no-clobber); whoever wins the rename
+# emits the reminder, the loser silently skips DEEP this round and tries
+# the next oldest on the next prompt.
 QUEUE_FILE=""
 QUEUE_SIZE=0
 if [ -d "$QUEUE_DIR" ]; then
-  QUEUE_FILE="$(ls -1 "$QUEUE_DIR"/*.queue 2>/dev/null | sort | head -n1)"
   QUEUE_SIZE="$(ls -1 "$QUEUE_DIR"/*.queue 2>/dev/null | wc -l | tr -d ' ')"
+  CANDIDATE="$(ls -1 "$QUEUE_DIR"/*.queue 2>/dev/null | sort | head -n1)"
+  if [ -n "$CANDIDATE" ] && [ -f "$CANDIDATE" ]; then
+    CLAIMED="${CANDIDATE%.queue}.claimed-$SESSION"
+    if mv -n "$CANDIDATE" "$CLAIMED" 2>/dev/null && [ -f "$CLAIMED" ]; then
+      QUEUE_FILE="$CLAIMED"
+    fi
+  fi
 fi
 
 # Pending proposal counts for the gentle nudge in every reminder.
@@ -66,7 +80,7 @@ proposal_status_line() {
   if [ "$p_count" != "0" ] || [ "$g_count" != "0" ]; then
     printf '\n[Niblet] %s project proposal(s) in %s, %s global in %s.\n' \
       "$p_count" "$PROPOSALS_DIR" "$g_count" "$GLOBAL_PROPOSALS_DIR"
-    printf 'Review each and promote with: %s/niblet-promote <proposal-file>\n' "$PLUGIN_BIN"
+    printf 'Review each and promote with: niblet-promote <proposal-file>\n'
   fi
 }
 
@@ -80,32 +94,50 @@ responding to the user. Auto-write tier — safe, local, reversible.
 1. Briefly review the turn. Skip if trivial (chit-chat, formatting only).
 
 2. For findings about THIS project (architecture, gotchas, "why X works
-   this way", where a thing lives) → emit an ADD_KB_ENTRY action via the
-   secure writer:
+   this way", where a thing lives) → build an ADD_KB_ENTRY ACTION as
+   a JSON object and feed it to the secure writer via stdin.
 
-       echo '{"action":"ADD_KB_ENTRY","scope":"project","topic":"<slug>.md","content":"<markdown>"}' \\
-         | "$PLUGIN_BIN/niblet-apply" --project-root "$PROJECT_ROOT"
+   Step a (Write tool): write the JSON to a staging file. The Write tool
+   does NOT shell-interpret content, so any quote or metachar in your
+   content is safe:
+
+       Write file_path=$STORE/inbox/kb-<slug>.json
+       Content:
+         {"action":"ADD_KB_ENTRY","scope":"project","topic":"<slug>.md","content":"<markdown>"}
+
+   Step b (Bash tool): pipe the file into niblet-apply:
+
+       niblet-apply --project-root "$PROJECT_ROOT" < $STORE/inbox/kb-<slug>.json
 
    The script validates the slug, checks containment, and writes to:
        $KB_DIR/<slug>.md
 
 3. For user corrections / preferences that should outlive this session →
+   same pattern with UPDATE_MEMORY:
 
-       echo '{"action":"UPDATE_MEMORY","scope":"project","file":"feedback_<slug>.md","content":"<markdown>"}' \\
-         | "$PLUGIN_BIN/niblet-apply" --project-root "$PROJECT_ROOT"
+       Write file_path=$STORE/inbox/mem-<slug>.json
+       Content:
+         {"action":"UPDATE_MEMORY","scope":"project","file":"feedback_<slug>.md","content":"<markdown>"}
+
+       niblet-apply --project-root "$PROJECT_ROOT" < $STORE/inbox/mem-<slug>.json
 
    Writes to: $MEM_DIR/feedback_<slug>.md
 
-4. Do NOT use Edit/Write directly. niblet-apply is the only safe path —
-   it enforces slug rules and prevents writes outside the artifact dirs.
+4. Never \`echo '<json>' | niblet-apply\`. The content field can carry
+   single quotes and shell metachars; the echo would interpolate them on
+   the command line BEFORE the script validates. Always Write-then-stdin.
 
-5. Do NOT create skills, commands, or modify CLAUDE.md here. Those happen
+5. Do NOT use Edit/Write directly to KB/memory/skills/commands — niblet-apply
+   is the only safe path. It enforces slug rules and prevents writes
+   outside the artifact dirs.
+
+6. Do NOT create skills, commands, or modify CLAUDE.md here. Those happen
    in the DEEP checkpoint and only as proposals.
 
-6. After writing (or deciding nothing is worth keeping), delete the marker:
+7. After writing (or deciding nothing is worth keeping), delete the marker:
        rm $PENDING_FAST
 
-7. Now respond to the user's actual request.
+8. Now respond to the user's actual request.
 $(proposal_status_line)
 EOF
 }
@@ -165,10 +197,14 @@ Before responding to the user, do this:
    (git, security, generic terminal idioms). Default scope=project.
    ---
 
-2. Parse the lines between the sentinels. For EACH JSON object, pipe it
-   to the secure writer — do NOT use Edit/Write directly:
+2. Parse the lines between the sentinels. For EACH JSON object, stage it
+   via Write to a per-action file under $STORE/inbox/ and pipe THAT file
+   into niblet-apply — do NOT \`echo '<json>' | …\`. ACTION content can
+   carry single quotes and shell metachars; echo would interpolate them
+   before validation. Do NOT use Edit/Write directly to the target tree.
 
-       echo '<json>' | "$PLUGIN_BIN/niblet-apply" --project-root "$PROJECT_ROOT"
+       Write file_path=$STORE/inbox/<random>.json   (the JSON object)
+       niblet-apply --project-root "$PROJECT_ROOT" < $STORE/inbox/<random>.json
 
    The script validates slugs, enforces containment, and routes:
      - ADD_KB_ENTRY/UPDATE_MEMORY scope=project   → auto-write

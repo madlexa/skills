@@ -168,7 +168,18 @@ niblet_canonical_path() {
     python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$p" 2>/dev/null && return 0
   fi
 
+  # `realpath` is available on macOS (BSD) and most Linux distros (GNU
+  # coreutils). Both resolve symlinks on existing prefixes; for tails that
+  # don't exist yet, GNU realpath has `-m` and BSD silently fakes it.
+  if command -v realpath >/dev/null 2>&1; then
+    # Try GNU --canonicalize-missing first, then plain (BSD).
+    realpath -m "$p"        2>/dev/null && return 0
+    realpath    "$p"        2>/dev/null && return 0
+  fi
+
   # Bash-only fallback: make absolute, then collapse . and ..
+  # NOTE: this does NOT resolve symlinks. Callers concerned about
+  # symlinks-in-path must additionally call niblet_assert_no_symlink_in_path.
   case "$p" in /*) ;; *) p="$PWD/$p" ;; esac
   local result=""
   local seg
@@ -215,4 +226,38 @@ niblet_assert_under_dir() {
   [ "$cc" = "$cr" ] && return 0
   echo "escape" >&2
   return 1
+}
+
+# niblet_assert_no_symlink_in_path <candidate_path> <allowed_root>
+#
+# Defence in depth on top of containment. Walks the existing prefix of
+# candidate_path (its parent chain, plus the destination itself if it
+# exists) and refuses if ANY segment between allowed_root (exclusive)
+# and candidate (inclusive) is a symlink. This blocks attacks where a
+# pre-existing symlink under the allowed dir points outside the realm —
+# even when the canonicalizer is buggy or absent.
+#
+# Both arguments must already be canonicalised (caller's responsibility);
+# this function only walks existing segments and tests `-L`.
+niblet_assert_no_symlink_in_path() {
+  local candidate="$1"
+  local root="$2"
+  [ -n "$candidate" ] || return 1
+  [ -n "$root" ]      || return 1
+
+  # Walk from candidate upward to root. Skip non-existent leaves; only
+  # existing segments can be symlinks.
+  local cur="$candidate"
+  while [ -n "$cur" ] && [ "$cur" != "$root" ] && [ "$cur" != "/" ]; do
+    if [ -L "$cur" ]; then
+      echo "symlink-in-path:$cur" >&2
+      return 1
+    fi
+    case "$cur" in
+      "$root"/*) ;;
+      *) break ;;  # walked above the allowed root
+    esac
+    cur="$(dirname "$cur")"
+  done
+  return 0
 }

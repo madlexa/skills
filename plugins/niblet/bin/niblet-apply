@@ -9,7 +9,17 @@
 # `topic` / `name` / `file` value cannot escape the allowed directory.
 #
 # Usage:
-#   echo '<json>' | niblet-apply --project-root <abs-path>
+#   # Step 1 (Write tool): stage the ACTION JSON to a file. Write does
+#   # NOT shell-interpret content, so single quotes / metacharacters in
+#   # the payload are safe.
+#   #   .niblet/inbox/<random>.json   ← JSON object goes here
+#   #
+#   # Step 2 (Bash tool): feed the file via stdin redirection.
+#   niblet-apply --project-root <abs-path> < .niblet/inbox/<random>.json
+#
+# Never `echo '<json>' | niblet-apply` — a single quote inside content
+# closes the shell literal and runs whatever follows BEFORE the helper
+# validates anything. Always Write-then-stdin.
 #
 # Output:
 #   On success:  "applied: <action> -> <target>"   or
@@ -37,7 +47,13 @@ while [ $# -gt 0 ]; do
 done
 
 JSON="$(cat)"
-[ -n "$JSON" ] || { echo "rejected: empty input" >&2; exit 64; }
+[ -n "$JSON" ] || {
+  echo "rejected: empty stdin." >&2
+  echo "  Usage: niblet-apply --project-root <abs-path> < <inbox-file>.json" >&2
+  echo "  Never \`echo '<json>' | niblet-apply\` — shell metachars in content" >&2
+  echo "  can break out of single quotes. Write the JSON to a file first." >&2
+  exit 64
+}
 
 command -v jq >/dev/null 2>&1 || { echo "rejected: jq is required" >&2; exit 70; }
 
@@ -78,9 +94,32 @@ ts() { date -u +%Y%m%dT%H%M%SZ; }
 write_proposal() {
   local target_dir="$1" reason="$2" target_path="$3"
   mkdir -p "$target_dir" 2>/dev/null
-  local fname; fname="$(ts)-${ACTION}-$(printf '%s' "$NAME$TOPIC$FILE" | tr -c 'a-zA-Z0-9' '-' | tr -s '-' | sed 's/^-//;s/-$//')"
-  [ -z "$fname" ] && fname="$(ts)-${ACTION}"
-  local proposal_path="$target_dir/${fname}.md"
+
+  # Build a slug for the filename. Prefer the action's natural identifier
+  # (NAME / TOPIC / FILE). For UPDATE_CLAUDE, derive from SECTION. Falls
+  # back to "unnamed" so the filename is never bare "<ts>-<ACTION>-.md".
+  local slug_src="$NAME$TOPIC$FILE"
+  if [ -z "$slug_src" ] && [ "$ACTION" = "UPDATE_CLAUDE" ]; then
+    slug_src="$SECTION"
+  fi
+  local slug
+  slug="$(printf '%s' "$slug_src" \
+    | LC_ALL=C tr '[:upper:]' '[:lower:]' \
+    | LC_ALL=C tr -c 'a-z0-9._-' '-' \
+    | tr -s '-' \
+    | sed 's/^-//;s/-$//' \
+    | LC_ALL=C cut -c -32)"
+  [ -z "$slug" ] && slug="unnamed"
+
+  local base="$(ts)-${ACTION}-${slug}"
+  # Avoid silently overwriting an earlier proposal in the same second
+  # (UPDATE_CLAUDE batches with no NAME/TOPIC/FILE are the common case).
+  local proposal_path="$target_dir/${base}.md"
+  local i=1
+  while [ -e "$proposal_path" ]; do
+    i=$((i + 1))
+    proposal_path="$target_dir/${base}-${i}.md"
+  done
   {
     echo "---"
     echo "action: $ACTION"
@@ -111,7 +150,14 @@ proposal() {
 }
 
 write_auto() {
-  local target_path="$1"
+  local target_path="$1" allowed_root="$2"
+  # Defence in depth: refuse to write through a symlink even if the
+  # canonicalizer said the target is inside allowed_root. A pre-existing
+  # symlink in the path can let a "safe" write land elsewhere on disk.
+  if ! niblet_assert_no_symlink_in_path "$target_path" "$allowed_root" 2>/dev/null; then
+    proposal "symlink-in-path:target=$target_path"
+    return
+  fi
   mkdir -p "$(dirname "$target_path")" 2>/dev/null
   printf '%s\n' "$CONTENT" > "$target_path"
   echo "applied: $ACTION -> $target_path"
@@ -131,7 +177,7 @@ case "$ACTION" in
     target="$KB/$TOPIC"
     case "$target" in *.md) ;; *) target="$target.md" ;; esac
     niblet_assert_under_dir "$target" "$KB" 2>/dev/null || proposal "path-escape:topic=$TOPIC"
-    write_auto "$target"
+    write_auto "$target" "$KB"
     ;;
 
   UPDATE_MEMORY)
@@ -141,7 +187,7 @@ case "$ACTION" in
     target="$MEM/$FILE"
     case "$target" in *.md) ;; *) target="$target.md" ;; esac
     niblet_assert_under_dir "$target" "$MEM" 2>/dev/null || proposal "path-escape:file=$FILE"
-    write_auto "$target"
+    write_auto "$target" "$MEM"
     ;;
 
   CREATE_SKILL|CREATE_COMMAND)

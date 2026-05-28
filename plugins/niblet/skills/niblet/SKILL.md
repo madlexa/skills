@@ -29,17 +29,35 @@ Proposals require a human action to take effect.
 
 ### Single write entry point — `bin/niblet-apply`
 
-You do NOT call Edit/Write directly when acting on a NIBLET CHECKPOINT.
-Every action goes through the plugin's secure helper, which validates
-slugs, enforces path containment, and routes to auto-write vs proposal:
+You do NOT call Edit/Write directly to KB/memory/skills/commands/CLAUDE.md
+when acting on a NIBLET CHECKPOINT. Every action goes through the plugin's
+secure helper, which validates slugs, enforces path containment, and
+routes to auto-write vs proposal.
+
+**Always Write-then-stdin. Never echo-pipe.** The `content` / `addition`
+fields can legitimately contain single quotes, backslashes, and other
+shell metachars (it's free-form markdown). An `echo '<json>' | …`
+invocation would let those bytes break out of the quoting before
+niblet-apply ever validates anything. The Write tool does not
+shell-interpret content, so the staged file is byte-exact:
 
 ```bash
-echo '{"action":"ADD_KB_ENTRY","scope":"project","topic":"auth.md","content":"…"}' \
-  | "${CLAUDE_PLUGIN_ROOT}/bin/niblet-apply" --project-root "$PROJECT_ROOT"
+# Step 1 (Write tool, NOT bash): create the JSON file
+Write file_path=<project>/.niblet/inbox/<random>.json
+Content:
+  {"action":"ADD_KB_ENTRY","scope":"project","topic":"auth.md","content":"…"}
+
+# Step 2 (Bash tool): feed via stdin redirection. `niblet-apply` resolves
+# on PATH — Claude Code adds the plugin's bin/ to the hook/Bash PATH, so
+# the bare command works without `${CLAUDE_PLUGIN_ROOT}` expansion.
+niblet-apply --project-root "$PROJECT_ROOT" \
+  < <project>/.niblet/inbox/<random>.json
 ```
 
 The reminder text spells out the exact command per action. Direct Edit/Write
-bypasses validation and is a security regression — don't do it.
+to the target tree bypasses validation and is a security regression —
+don't do it. `echo '<json>' | niblet-apply` is also a security regression
+— don't do it either.
 
 ## When you see "NIBLET CHECKPOINT (fast)"
 
@@ -50,7 +68,8 @@ A turn just ended. Before responding to the user:
    - "Why does Y work this way?"
    - "User prefers A over B because…"
 
-2. **Pipe an ACTION through `niblet-apply`** — never Edit/Write directly:
+2. **Stage an ACTION JSON via Write, then pipe it into `niblet-apply`** —
+   never Edit/Write the target file directly, never `echo '<json>' | …`:
    - Project facts → `ADD_KB_ENTRY` action with `topic` (slug, ending `.md`)
    - User preferences → `UPDATE_MEMORY` action with `file=feedback_<slug>.md`
 
@@ -82,9 +101,11 @@ A previous session has ended. Its raw log is queued for analysis.
    <<<NIBLET ACTIONS END>>>
    ```
 
-3. **Pipe each ACTION line** through `niblet-apply` — the helper enforces
-   slug rules, containment, and the auto vs proposal routing. You don't
-   route yourself; the helper does. Watch its stdout:
+3. **Stage each ACTION JSON via Write, then pipe via stdin** through
+   `niblet-apply` — the helper enforces slug rules, containment, and the
+   auto vs proposal routing. You don't route yourself; the helper does.
+   Use one inbox file per ACTION (`$STORE/inbox/<random>.json`). Watch
+   stdout:
    ```
    applied: ADD_KB_ENTRY -> /…/.claude/kb/auth.md
    proposal: CREATE_SKILL -> /…/.niblet/proposals/<ts>-<slug>.md
@@ -97,15 +118,15 @@ A previous session has ended. Its raw log is queued for analysis.
 
 5. **Tell the user briefly** what was applied vs proposed, including
    `<project>/.niblet/proposals/` so they can review with
-   `bin/niblet-promote` — never raw `mv`. Then respond to their request.
+   `niblet-promote` — never raw `mv`. Then respond to their request.
 
-## Proposal promotion — `bin/niblet-promote`
+## Proposal promotion — `niblet-promote`
 
 When the user has reviewed a proposal and wants to apply it, the canonical
 command is:
 
 ```bash
-"${CLAUDE_PLUGIN_ROOT}/bin/niblet-promote" <proposal-file>
+niblet-promote <proposal-file>
 ```
 
 The helper is action-aware:

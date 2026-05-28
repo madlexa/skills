@@ -68,24 +68,57 @@ SECTION="$(envelope_field section)"
 [ -n "$ACTION" ] || { echo "proposal missing 'action' field" >&2; exit 65; }
 [ -n "$TARGET" ] || { echo "proposal missing 'target' field" >&2; exit 65; }
 
+# Hard-clamp the target for UPDATE_CLAUDE — it can only ever be the project's
+# CLAUDE.md, regardless of what the proposal envelope claims. A tampered
+# proposal with `target: README.md` (or any other path under the project)
+# would otherwise pass the containment check below and silently mutate a
+# different file. We overwrite TARGET *before* containment runs.
+if [ "$ACTION" = "UPDATE_CLAUDE" ]; then
+  ENFORCED_TARGET="$(niblet_project_root "$PWD")/CLAUDE.md"
+  # Compare in canonical form so /var ↔ /private/var (macOS) doesn't trip
+  # the tampering warning when the proposal envelope and current process
+  # happen to use different symlink paths to the same file.
+  TARGET_CANON="$(niblet_canonical_path "$TARGET" 2>/dev/null || printf '%s' "$TARGET")"
+  ENFORCED_CANON="$(niblet_canonical_path "$ENFORCED_TARGET" 2>/dev/null || printf '%s' "$ENFORCED_TARGET")"
+  if [ "$TARGET_CANON" != "$ENFORCED_CANON" ]; then
+    printf 'warning: UPDATE_CLAUDE target overridden from %s to %s\n' \
+      "$TARGET" "$ENFORCED_TARGET" >&2
+  fi
+  TARGET="$ENFORCED_TARGET"
+fi
+
+# Map action → artifact kind that niblet_artifact_dir understands.
+artifact_kind_for_action() {
+  case "$1" in
+    CREATE_SKILL)   echo "skills"   ;;
+    CREATE_COMMAND) echo "commands" ;;
+    ADD_KB_ENTRY)   echo "kb"       ;;
+    UPDATE_MEMORY)  echo "memory"   ;;
+    *)              echo ""         ;;
+  esac
+}
+
 # Decide the allowed root for containment.
+#
+# For ADD_KB_ENTRY / UPDATE_MEMORY / CREATE_SKILL / CREATE_COMMAND we ask
+# `niblet_artifact_dir` (which already knows about Claude `.claude/` vs
+# Kimi `.kimi/`) for the per-kind/scope root. For UPDATE_CLAUDE the
+# allowed root is the project root itself (CLAUDE.md lives directly under
+# it). Runtime-home lookups go through `niblet_runtime_home`, never the
+# non-existent helper that an earlier draft of this file called.
 allowed_root() {
+  local pr; pr="$(niblet_project_root "$PWD")"
   case "$ACTION" in
     CREATE_SKILL|CREATE_COMMAND|ADD_KB_ENTRY|UPDATE_MEMORY)
-      # Strip /SKILL.md or /<file>.md suffix to get the artifact dir; check
-      # that the target stays under the appropriate niblet dir.
-      local rt
-      rt="$(crystallizer_runtime_home 2>/dev/null || echo "$HOME/.claude")"
-      # Accept either project artifact dirs or runtime home subtrees.
-      local pr; pr="$(niblet_project_root "$PWD")"
-      if [ "$SCOPE" = "global" ]; then
-        echo "$rt"
-      else
-        echo "$pr/.claude"
-      fi
+      local kind; kind="$(artifact_kind_for_action "$ACTION")"
+      niblet_artifact_dir "$kind" "$SCOPE" "$pr"
       ;;
     UPDATE_CLAUDE)
-      niblet_project_root "$PWD"
+      # Allowed root for UPDATE_CLAUDE is intentionally a directory whose
+      # only legal child is CLAUDE.md — we still containment-check below
+      # that the (already-clamped) TARGET equals that exact file. Returning
+      # `$pr` here would let a tampered target like README.md sail through.
+      echo "$pr"
       ;;
     *)
       echo ""
@@ -98,6 +131,14 @@ ROOT="$(allowed_root)"
 
 if ! niblet_assert_under_dir "$TARGET" "$ROOT" 2>/dev/null; then
   echo "containment check failed: $TARGET not under $ROOT" >&2
+  exit 66
+fi
+
+# Defence in depth: refuse promotion through a symlink, regardless of what
+# the canonicalizer claims. Catches pre-existing symlinks under the allowed
+# tree that point outside it.
+if ! niblet_assert_no_symlink_in_path "$TARGET" "$ROOT" 2>/dev/null; then
+  echo "symlink-in-path check failed: refusing to promote through symlink under $TARGET" >&2
   exit 66
 fi
 
@@ -122,25 +163,40 @@ case "$ACTION" in
       rm -f "$PROPOSAL"
       exit 0
     fi
-    # If section heading exists, append payload right after the heading.
-    # If not, append a new "## section" block at the end.
-    if grep -qE "^## ${SECTION}[[:space:]]*$" "$TARGET"; then
-      # Use awk to insert payload after the heading line.
-      tmp="$(mktemp)"
-      awk -v sec="## $SECTION" -v add="$local_payload" '
-        BEGIN { inserted = 0 }
-        {
-          print
-          if (!inserted && $0 == sec) {
-            print ""
-            print add
-            inserted = 1
-          }
+    # Single awk pass: detect the heading by EXACT string match (no regex,
+    # so a section literal like ".*" or "[admin]" doesn't get reinterpreted)
+    # and insert the payload right after it. If awk reports it didn't find
+    # the heading, append a fresh "## section" block at the end of the file.
+    #
+    # The previous implementation used `grep -E` for detection but `awk`
+    # exact-match for insertion. With a regex-metachar section, grep
+    # matched any "## …" line, so detection said "yes", but awk found no
+    # literal "## .*" line, so insertion silently no-op'd — payload lost.
+    tmp="$(mktemp)"
+    SECTION_LINE="## $SECTION"
+    # `awk` returns 1 when the heading wasn't found. `set -e` would abort
+    # the script before we got to read $?, so disable it just around this
+    # call and re-enable immediately after.
+    set +e
+    awk -v sec="$SECTION_LINE" -v add="$local_payload" '
+      BEGIN { inserted = 0 }
+      {
+        print
+        if (!inserted && $0 == sec) {
+          print ""
+          print add
+          inserted = 1
         }
-      ' "$TARGET" > "$tmp"
+      }
+      END { exit inserted ? 0 : 1 }
+    ' "$TARGET" > "$tmp"
+    AWK_RC=$?
+    set -e
+    if [ "$AWK_RC" = "0" ]; then
       mv "$tmp" "$TARGET"
       echo "promoted: UPDATE_CLAUDE -> $TARGET (appended under '$SECTION')"
     else
+      rm -f "$tmp"
       printf '\n## %s\n\n%s\n' "$SECTION" "$local_payload" >> "$TARGET"
       echo "promoted: UPDATE_CLAUDE -> $TARGET (added section '$SECTION')"
     fi
