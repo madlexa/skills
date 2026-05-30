@@ -1,3 +1,4 @@
+<!-- DEPRECATED 2026-05-30T10:12:07Z -->
 # niblet-apply: write_proposal loses REASON and EVIDENCE
 
 ## Bug

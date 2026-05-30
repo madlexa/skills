@@ -15,6 +15,7 @@ Then install any plugin from it:
 
 ```
 /plugin install niblet@madlexa-skills
+/plugin install speculator@madlexa-skills
 ```
 
 To update later:
@@ -66,6 +67,29 @@ subsequent session drains, even with a new session id. No orphan markers.
 reminder so the agent knows which `.claude/kb/` topics exist.
 
 See [plugins/niblet/README.md](plugins/niblet/README.md).
+
+### speculator (v0.1.5)
+
+A graph-oriented knowledge base for AI coding sessions. Speculator stores your
+architecture as a knowledge graph of entities and edges right in your repo, so
+Claude queries the graph instead of re-reading dozens of files before writing a
+single line.
+
+**TypeScript CLI + MCP server** — a `speculator` CLI (add, get, list, search,
+update, stats, export, …) plus an MCP server exposing the same graph operations
+as tools the agent can call directly.
+
+**Hook-driven context injection** — a SessionStart hook surfaces knowledge-base
+stats, and a UserPromptSubmit hook searches the graph for the current prompt and
+injects the most relevant entities and edges — zero manual lookup.
+
+**Curation agents** — ships `speculator-ai-engineer`,
+`speculator-typescript-cli-developer`, and `speculator-mcp-protocol-engineer`
+for building and maintaining the graph.
+
+Requires Node.js (≥ 20) for the CLI and MCP server. The hooks are POSIX shell.
+
+See [plugins/speculator/README.md](plugins/speculator/README.md).
 
 ## Structure
 

@@ -14,6 +14,16 @@
       "author": {
         "name": "madlexa"
       }
+    },
+    {
+      "name": "speculator",
+      "source": "./plugins/speculator",
+      "description": "Graph-oriented knowledge base for AI coding sessions. Speculator stores your architecture as a knowledge graph of entities and edges right in your repo — so Claude queries the graph instead of re-reading dozens of files. Ships a TypeScript CLI + MCP server, hook-driven context injection on every prompt, and agents for graph curation. Stop paying tokens to find your own code. Runs on macOS/Linux; Windows via WSL2 or Git Bash.",
+      "version": "0.1.5",
+      "keywords": ["knowledge-graph", "knowledge", "memory", "markdown", "cli", "mcp", "skills", "architecture", "context", "graph"],
+      "author": {
+        "name": "madlexa"
+      }
     }
   ]
 }

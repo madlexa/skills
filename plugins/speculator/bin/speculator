@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# speculator — CLI wrapper that runs the compiled dist/cli.js with node.
+#
+# Resolves the bundled CLI in this order:
+#   1. $CLAUDE_PLUGIN_ROOT/dist/cli.js   (installed plugin)
+#   2. <plugin-root>/dist/cli.js         (this script lives in <plugin-root>/bin/)
+#
+# All arguments are forwarded verbatim to the CLI.
+#
+# Exit codes:
+#   0   success (or whatever the CLI returns)
+#   69  node not found on PATH
+#   70  dist/cli.js not found (run `npm run build`)
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+PLUGIN_ROOT="$(cd "$SCRIPT_DIR/.." 2>/dev/null && pwd)"
+
+command -v node >/dev/null 2>&1 || {
+  printf 'speculator: node not found on PATH\n' >&2
+  exit 69
+}
+
+CLI=""
+if [ -n "$CLAUDE_PLUGIN_ROOT" ] && [ -f "$CLAUDE_PLUGIN_ROOT/dist/cli.js" ]; then
+  CLI="$CLAUDE_PLUGIN_ROOT/dist/cli.js"
+elif [ -f "$PLUGIN_ROOT/dist/cli.js" ]; then
+  CLI="$PLUGIN_ROOT/dist/cli.js"
+fi
+
+[ -n "$CLI" ] || {
+  printf 'speculator: dist/cli.js not found — run `npm run build` in the plugin directory\n' >&2
+  exit 70
+}
+
+exec node "$CLI" "$@"

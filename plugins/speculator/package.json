@@ -1,0 +1,47 @@
+{
+  "name": "@madlexa/speculator",
+  "version": "0.1.5",
+  "description": "Graph-oriented knowledge base in Markdown files",
+  "main": "dist/cli.js",
+  "bin": {
+    "speculator": "bin/speculator",
+    "speculator-mcp": "dist/mcp.js"
+  },
+  "files": [
+    "dist",
+    "bin"
+  ],
+  "exports": {
+    ".": "./dist/cli.js",
+    "./mcp": "./dist/mcp.js"
+  },
+  "scripts": {
+    "build": "esbuild src/cli.ts src/mcp.ts --bundle --minify --platform=node --target=node20 --format=cjs --outdir=dist",
+    "typecheck": "tsc --noEmit",
+    "prepublish": "npm run build",
+    "test": "bash tests/smoke_test.sh",
+    "test:unit": "vitest run",
+    "test:coverage": "vitest run --coverage"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "commander": "^14.0.3",
+    "uuid": "^13.0.0",
+    "yaml": "^2.8.3"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "@vitest/coverage-v8": "^4.1.1",
+    "esbuild": "^0.27.4",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2",
+    "vitest": "^4.1.1"
+  },
+  "keywords": [
+    "knowledge-graph",
+    "markdown",
+    "cli"
+  ],
+  "license": "MIT"
+}

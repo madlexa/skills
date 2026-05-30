@@ -1,0 +1,4 @@
+# dist/ holds esbuild bundles (our code + vendored deps). It is a generated
+# build artifact, so exclude it from whitespace linting — `git diff --check`
+# would otherwise flag trailing whitespace inside bundled third-party code.
+dist/** -whitespace linguist-generated=true
