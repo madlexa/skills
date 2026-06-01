@@ -94,6 +94,24 @@ maybe_queue_distill() {
 
 maybe_queue_distill
 
+# Sweep abandoned claims. A `.claimed-<session>` file means some prior session
+# claimed a checkpoint but never finished it (e.g. the turn died on an API error).
+# Such files litter the queue dirs and keep the proposal/queue status line nagging.
+# Delete any older than NIBLET_CLAIM_STALE_HOURS (default 24h). Deleting (rather
+# than re-queueing) is correct: a prior session already attempted the work, and
+# on_session_end.sh only re-enqueues for sessions that did real work.
+_sweep_stale_claims() {
+  local hours mins
+  hours="${NIBLET_CLAIM_STALE_HOURS:-24}"
+  case "$hours" in *[!0-9]*) hours=24 ;; esac
+  mins=$((hours * 60))
+  local d
+  for d in "$QUEUE_DIR" "$DISTILL_QUEUE_DIR" "$AUDIT_QUEUE_DIR"; do
+    [ -d "$d" ] && find "$d" -maxdepth 1 -name '*.claimed-*' -type f -mmin "+$mins" -delete 2>/dev/null
+  done
+}
+_sweep_stale_claims
+
 # Atomically claim the oldest queue entry (FIFO) so two parallel new
 # sessions cannot both pick the same DEEP job. We rename `.queue` to
 # `.claimed-<session>` via `mv -n` (no-clobber); whoever wins the rename
@@ -156,10 +174,16 @@ emit_fast() {
   cat <<EOF
 NIBLET CHECKPOINT (fast) — session $SESSION
 
-A turn just ended. Niblet asks you to save anything worth keeping before
-responding to the user. Auto-write tier — safe, local, reversible.
+Background bookkeeping — NON-BLOCKING. First fully handle the user's request.
+This is an auto-write tier (safe, local, reversible) note-to-self; it must never
+delay, replace, or precede the user's actual task. Do everything below QUIETLY —
+do not narrate it and never paste raw JSON action bodies into your reply to the
+user. After you've handled the user (or right away if there's nothing to answer),
+optionally do the following.
 
-1. Briefly review the turn. Skip if trivial (chit-chat, formatting only).
+1. Briefly review the turn. Skip if trivial (chit-chat, formatting only). If
+   there's nothing worth keeping, or you're mid-task and unsure, just
+   \`rm $PENDING_FAST\` and move on silently — no narration, no NOTHING file.
 
 2. For findings about THIS project (architecture, gotchas, "why X works
    this way", where a thing lives) → build an ADD_KB_ENTRY ACTION as
@@ -205,7 +229,8 @@ responding to the user. Auto-write tier — safe, local, reversible.
 7. After writing (or deciding nothing is worth keeping), delete the marker:
        rm $PENDING_FAST
 
-8. Now respond to the user's actual request.
+8. Return to (or continue with) the user's actual request. If you already
+   answered it, you're done — do not announce the checkpoint.
 $(proposal_status_line)
 EOF
 }
@@ -225,7 +250,18 @@ A previous session ended. Niblet asks you to spawn a sub-agent to extract
 reusable workflow patterns from its raw log. Your active context shouldn't
 be distracted by that analysis.
 
-Before responding to the user, do this:
+Background bookkeeping — NON-BLOCKING. FIRST fully handle the user's request,
+THEN (only if it doesn't delay them) process this. If you're mid-task or unsure,
+just \`rm $QUEUE_FILE\` and skip — a future session will not re-create it.
+Do all of this QUIETLY: never paste raw JSON action bodies into your reply, and
+if the analysis yields only NOTHING, silently \`rm $QUEUE_FILE\` without writing
+a NOTHING file and without narrating it to the user.
+
+Fast skip: if the raw log "$q_raw" is absent or shows fewer than
+${NIBLET_DEEP_MIN_TOOLCALLS:-8} tool calls, there is nothing to extract — just
+\`rm $QUEUE_FILE\` and return to the user.
+
+When you do process it:
 
 1. Use the Task / Agent tool with subagent_type=general-purpose and the
    following prompt verbatim:
@@ -294,9 +330,9 @@ Before responding to the user, do this:
 3. Delete the processed queue entry:
        rm $QUEUE_FILE
 
-4. Tell the user briefly what was applied vs proposed, including the
-   proposals directory path so they can review. Then respond to their
-   actual request.
+4. Only if something was actually applied or proposed, mention it in one short
+   line (with the proposals dir path). If everything was NOTHING, say nothing —
+   just return to the user's request.
 $(proposal_status_line)
 EOF
 }
@@ -308,7 +344,13 @@ NIBLET CHECKPOINT (distill) — queue size $DISTILL_SIZE, processing $(basename 
 The project KB has grown above the distill threshold. Niblet asks you to spawn
 a sub-agent to consolidate redundant or overlapping KB entries.
 
-Before responding to the user, do this:
+Background bookkeeping — NON-BLOCKING. FIRST fully handle the user's request,
+THEN (only if it doesn't delay them) process this. If you're mid-task or unsure,
+just \`rm $DISTILL_FILE\` and skip. Do it QUIETLY: never paste raw JSON action
+bodies into your reply, and if the result is only NOTHING, silently
+\`rm $DISTILL_FILE\` without writing a NOTHING file or narrating it.
+
+When you do process it:
 
 1. Use the Task / Agent tool with subagent_type=general-purpose and the
    following prompt verbatim:
@@ -362,9 +404,9 @@ Before responding to the user, do this:
 3. Delete the processed distill entry:
        rm $DISTILL_FILE
 
-4. Tell the user briefly what was merged, deprecated, or proposed, including
-   the proposals directory path so they can review. Then respond to their
-   actual request.
+4. Only if something was actually merged, deprecated, or proposed, mention it in
+   one short line (with the proposals dir path). If everything was NOTHING, say
+   nothing — just return to the user's request.
 $(proposal_status_line)
 EOF
 }
@@ -373,11 +415,16 @@ emit_audit() {
   cat <<EOF
 NIBLET CHECKPOINT (audit) — queue size $AUDIT_SIZE, processing $(basename "$AUDIT_FILE")
 
-Niblet is running a periodic artifact audit. Before responding to the user,
-spawn a sub-agent to check KB, memory, and artifact index for staleness or
-contradictions.
+Niblet is running a periodic artifact audit — checking KB, memory, and the
+artifact index for staleness or contradictions.
 
-Before responding to the user, do this:
+Background bookkeeping — NON-BLOCKING. FIRST fully handle the user's request,
+THEN (only if it doesn't delay them) process this. If you're mid-task or unsure,
+just \`rm $AUDIT_FILE\` and skip. Do it QUIETLY: never paste raw JSON action
+bodies into your reply, and if the result is only NOTHING, silently
+\`rm $AUDIT_FILE\` without writing a NOTHING file or narrating it.
+
+When you do process it:
 
 1. Use the Task / Agent tool with subagent_type=general-purpose and the
    following prompt verbatim:
@@ -436,9 +483,9 @@ Before responding to the user, do this:
 3. Delete the processed audit entry:
        rm $AUDIT_FILE
 
-4. Tell the user briefly what was updated, deprecated, or proposed, including
-   the proposals directory path so they can review. Then respond to their
-   actual request.
+4. Only if something was actually updated, deprecated, or proposed, mention it in
+   one short line (with the proposals dir path). If everything was NOTHING, say
+   nothing — just return to the user's request.
 $(proposal_status_line)
 EOF
 }

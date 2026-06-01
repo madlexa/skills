@@ -84,9 +84,23 @@ to the target tree bypasses validation and is a security regression —
 don't do it. `echo '<json>' | niblet-apply` is also a security regression
 — don't do it either.
 
+## Checkpoints are background bookkeeping — non-blocking and silent
+
+All four checkpoints follow the same rules, no matter what the reminder says:
+
+- **User first.** Fully handle the user's request before processing a checkpoint.
+  If you're mid-task, or unsure it's worth it, just delete the marker/queue entry
+  and skip — a future session won't re-create it for a trivial session.
+- **Stay quiet.** Never paste raw JSON action bodies into your reply, and never
+  narrate the bookkeeping. Mention something in one short line *only* if an action
+  was actually applied or proposed.
+- **NOTHING = silence.** If the analysis yields only `NOTHING`, silently delete the
+  queue entry. Do not write a `NOTHING` file and do not tell the user.
+
 ## When you see "NIBLET CHECKPOINT (fast)"
 
-A turn just ended. Before responding to the user:
+A turn just ended. After you've handled the user (or right away if there's
+nothing to answer), quietly:
 
 1. **Review** the turn. Look for durable, non-obvious knowledge:
    - "Where does X live?"
@@ -109,11 +123,15 @@ A turn just ended. Before responding to the user:
 6. **Delete the marker** the reminder names:
    `rm <project>/.niblet/sessions/<session-id>/PENDING_FAST`
 
-7. Now respond to the user's request.
+7. Return to the user's request (or, if you already answered it, you're done —
+   don't announce the checkpoint).
 
 ## When you see "NIBLET CHECKPOINT (deep)"
 
-A previous session has ended. Its raw log is queued for analysis.
+A previous session has ended. Its raw log is queued for analysis. Process it
+only *after* the user's request (see "background bookkeeping" above). If the
+raw log is absent or shows fewer than `NIBLET_DEEP_MIN_TOOLCALLS` (default 8)
+tool calls, there's nothing to extract — just `rm` the queue entry and move on.
 
 1. **Spawn** a `general-purpose` sub-agent via Task tool. Use the prompt
    verbatim from the reminder — it names the **queued raw log** (not the
@@ -141,14 +159,14 @@ A previous session has ended. Its raw log is queued for analysis.
 4. **Delete the queue entry** the reminder names:
    `rm <project>/.niblet/pending_deep/<ts>-<session>.queue`
 
-5. **Tell the user briefly** what was applied vs proposed, including
-   `<project>/.niblet/proposals/` so they can review with
-   `niblet-promote` — never raw `mv`. Then respond to their request.
+5. **Only if** something was applied or proposed, mention it in one short line
+   with `<project>/.niblet/proposals/` so they can review with `niblet-promote`
+   (never raw `mv`). If everything was `NOTHING`, say nothing.
 
 ## When you see "NIBLET CHECKPOINT (distill)"
 
 The project KB has grown above the distill threshold (default: 20 files or
-200 000 bytes). Before responding to the user:
+200 000 bytes). Process it only after the user's request (background bookkeeping):
 
 1. **Spawn** a `general-purpose` sub-agent via Task tool. Use the prompt
    verbatim from the reminder — it names the **KB directory**, memory
@@ -170,14 +188,14 @@ The project KB has grown above the distill threshold (default: 20 files or
 
 4. **Delete the claimed distill entry** the reminder names.
 
-5. **Tell the user briefly** what was merged, deprecated, or proposed.
-   Then respond to their request.
+5. **Only if** something was merged, deprecated, or proposed, mention it in one
+   short line. If everything was `NOTHING`, say nothing.
 
 ## When you see "NIBLET CHECKPOINT (audit)"
 
 A periodic audit is due. The niblet plugin triggers this after every N sessions
-(default: 5) by writing an entry to `.niblet/audit_queue/`. Before responding
-to the user:
+(default: 5) by writing an entry to `.niblet/audit_queue/`. Process it only after
+the user's request (background bookkeeping):
 
 1. **Spawn** a `general-purpose` sub-agent via Task tool. Use the prompt
    verbatim from the reminder — it names the **artifact index**, KB directory,
@@ -198,8 +216,8 @@ to the user:
 
 4. **Delete the claimed audit entry** the reminder names.
 
-5. **Tell the user briefly** what was updated, deprecated, or proposed.
-   Then respond to their request.
+5. **Only if** something was updated, deprecated, or proposed, mention it in one
+   short line. If everything was `NOTHING`, say nothing.
 
 ## Reviewing proposals — `niblet-proposal-reviewer`
 

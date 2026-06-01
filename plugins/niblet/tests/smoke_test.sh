@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
-# smoke_test.sh — end-to-end test of niblet v0.2.1 contract.
+# smoke_test.sh — end-to-end test of niblet v0.3.1 contract.
 #
 # Tests security boundary + lifecycle, not just plumbing:
 #
 #   1. observe.sh auto-init + sanitized capture (no tool content)
-#   2. on_stop.sh per-session PENDING_FAST + counter
+#   2. on_stop.sh per-session PENDING_FAST on edit turns + counter
 #   3. on_prompt_submit.sh FAST reminder for own session
 #   4. Stop ×5 does NOT escalate to DEEP (default threshold 20)
-#   5. on_session_end.sh writes a project-wide queue entry
+#   5. on_session_end.sh writes a queue entry for a session that did real work
 #   6. DEEP reminder reaches a NEW session id (cross-session delivery)
 #   7. Safety-net at low threshold writes queue entry, resets counter
+#   ...
+#   61. DEEP enqueue gated below NIBLET_DEEP_MIN_TOOLCALLS (+ override)
+#   62. FAST marker gated on file mutations (non-edit turn → no PENDING_FAST)
+#   63. stale .claimed-* swept, fresh claim preserved
 #   8. niblet-apply rejects path traversal in topic → proposal, CLAUDE.md untouched
 #   9. niblet-apply rejects path traversal in name (CREATE_SKILL)
 #   10. niblet-apply auto-writes ADD_KB_ENTRY when slug is valid
@@ -45,6 +49,20 @@ event_bash_with_secret() {
 event_stop() {
   local session="$1" cwd="$2"
   jq -nc --arg s "$session" --arg c "$cwd" '{session_id:$s, cwd:$c}'
+}
+event_write_file() {
+  local session="$1" cwd="$2" path="$3"
+  jq -nc --arg s "$session" --arg c "$cwd" --arg p "$path" \
+    '{session_id:$s, tool_name:"Write", cwd:$c, tool_input:{file_path:$p, content:"x"}, tool_response:{success:true}}'
+}
+# Seed N sanitized tool-call (post) events into a session's raw log so it clears
+# the DEEP enqueue gate (NIBLET_DEEP_MIN_TOOLCALLS). Uses Read events (no edits).
+seed_toolcalls() {
+  local session="$1" cwd="$2" n="$3" i=0
+  while [ "$i" -lt "$n" ]; do
+    event_read_with_secret "$session" "$cwd" "$cwd/src/seed$i.ts" | "$HOOKS/observe.sh" post >/dev/null
+    i=$((i + 1))
+  done
 }
 
 # Build action JSON safely via jq
@@ -95,9 +113,12 @@ fi
     && fail "root .gitignore was modified with .niblet/ entry — regression!" \
     || pass "root .gitignore exists but does NOT contain .niblet/ entry"; }
 
-title "2. on_stop.sh per-session PENDING_FAST + counter"
+title "2. on_stop.sh per-session PENDING_FAST (on edit turn) + counter"
+# v0.3.1: PENDING_FAST is gated on real file mutations. Record a Write event so
+# this turn qualifies as an edit turn and the marker is set.
+event_write_file "$SESSION_A" "$PROJECT" "$PROJECT/src/foo.ts" | "$HOOKS/observe.sh" post >/dev/null
 event_stop "$SESSION_A" "$PROJECT" | "$HOOKS/on_stop.sh" >/dev/null
-[ -f "$A_DIR/PENDING_FAST" ] && pass "PENDING_FAST per-session" || fail "no PENDING_FAST"
+[ -f "$A_DIR/PENDING_FAST" ] && pass "PENDING_FAST set on edit turn" || fail "no PENDING_FAST"
 [ "$(cat "$A_DIR/task_counter")" = "1" ] && pass "counter=1" || fail "counter wrong"
 
 title "3. on_prompt_submit FAST reminder mentions niblet-apply"
@@ -117,7 +138,10 @@ QUEUE_COUNT="$(find "$STORE/pending_deep" -maxdepth 1 -type f 2>/dev/null | wc -
 [ "$QUEUE_COUNT" = "0" ] && pass "no DEEP queue entry at 5 turns" \
   || fail "DEEP queue grew unexpectedly: $QUEUE_COUNT"
 
-title "5. on_session_end writes a project-wide queue entry"
+title "5. on_session_end writes a project-wide queue entry (session did real work)"
+# v0.3.1: DEEP enqueue is gated on >= NIBLET_DEEP_MIN_TOOLCALLS (default 8) tool
+# calls. Seed enough so this real session clears the gate.
+seed_toolcalls "$SESSION_A" "$PROJECT" 8
 event_stop "$SESSION_A" "$PROJECT" | "$HOOKS/on_session_end.sh" >/dev/null
 QUEUE_COUNT="$(find "$STORE/pending_deep" -maxdepth 1 -type f -name '*.queue' 2>/dev/null | wc -l | tr -d ' ')"
 [ "$QUEUE_COUNT" -ge "1" ] && pass "queue entry created" || fail "no queue file"
@@ -176,6 +200,9 @@ echo "$OUT_B" | grep -qE "${QUEUE_PREFIX}\.claimed-" \
 
 title "7. Safety-net writes queue entry, resets counter"
 SESSION_C="marathon-$(date +%s)"
+# v0.3.1: safety-net enqueue is also gated on real work. Seed tool calls so the
+# marathon session clears the gate when the turn counter trips the threshold.
+seed_toolcalls "$SESSION_C" "$PROJECT" 8
 export NIBLET_DEEP_THRESHOLD=3
 for i in 1 2 3; do
   event_stop "$SESSION_C" "$PROJECT" | "$HOOKS/on_stop.sh" >/dev/null
@@ -1347,6 +1374,59 @@ else
   fail "reason: check skipped — no proposal file"
   fail "evidence: check skipped — no proposal file"
 fi
+
+title "61. DEEP enqueue gated: trivial session (< MIN_TC tool calls) writes NO queue"
+# v0.3.1: breaks the self-perpetuating queue. A session below the tool-call
+# threshold must not seed a DEEP job for the next session.
+GATE_SESSION="gate-$(date +%s)"
+seed_toolcalls "$GATE_SESSION" "$PROJECT" 3   # 3 < default 8
+event_stop "$GATE_SESSION" "$PROJECT" | "$HOOKS/on_session_end.sh" >/dev/null
+GATE_Q="$(find "$STORE/pending_deep" -maxdepth 1 -type f -name "*-${GATE_SESSION}.queue" 2>/dev/null | wc -l | tr -d ' ')"
+[ "$GATE_Q" = "0" ] \
+  && pass "trivial session did NOT enqueue a DEEP job (gate works)" \
+  || fail "trivial session enqueued a DEEP job — gate broken"
+# And the override restores old behavior.
+GATE_SESSION2="gate2-$(date +%s)"
+seed_toolcalls "$GATE_SESSION2" "$PROJECT" 3
+event_stop "$GATE_SESSION2" "$PROJECT" | NIBLET_DEEP_MIN_TOOLCALLS=0 "$HOOKS/on_session_end.sh" >/dev/null
+GATE_Q2="$(find "$STORE/pending_deep" -maxdepth 1 -type f -name "*-${GATE_SESSION2}.queue" 2>/dev/null | wc -l | tr -d ' ')"
+[ "$GATE_Q2" -ge "1" ] \
+  && pass "NIBLET_DEEP_MIN_TOOLCALLS=0 restores unconditional enqueue" \
+  || fail "override did not restore unconditional enqueue"
+
+title "62. FAST marker gated: non-edit turn writes NO PENDING_FAST"
+# v0.3.1: PENDING_FAST only on turns that mutated project files.
+FG_SESSION="fastgate-$(date +%s)"
+seed_toolcalls "$FG_SESSION" "$PROJECT" 2   # Read events only — no edits
+FG_DIR="$STORE/sessions/$FG_SESSION"
+rm -f "$FG_DIR/PENDING_FAST" "$FG_DIR/fast_seen" 2>/dev/null
+event_stop "$FG_SESSION" "$PROJECT" | "$HOOKS/on_stop.sh" >/dev/null
+[ ! -f "$FG_DIR/PENDING_FAST" ] \
+  && pass "no PENDING_FAST on a non-edit turn (FAST gate works)" \
+  || fail "PENDING_FAST set on a non-edit turn — FAST gate broken"
+# Now an edit turn DOES set it.
+event_write_file "$FG_SESSION" "$PROJECT" "$PROJECT/src/edited.ts" | "$HOOKS/observe.sh" post >/dev/null
+event_stop "$FG_SESSION" "$PROJECT" | "$HOOKS/on_stop.sh" >/dev/null
+[ -f "$FG_DIR/PENDING_FAST" ] \
+  && pass "PENDING_FAST set once the turn edits a file" \
+  || fail "PENDING_FAST not set on an edit turn"
+
+title "63. stale .claimed-* swept, fresh claim preserved (on_prompt_submit)"
+SWEEP_DIR="$STORE/pending_deep"
+mkdir -p "$SWEEP_DIR"
+STALE_CLAIM="$SWEEP_DIR/20200101T000000Z-oldsession.claimed-deadsession"
+FRESH_CLAIM="$SWEEP_DIR/$(date -u +%Y%m%dT%H%M%SZ)-newsession.claimed-livesession"
+echo "session_id=oldsession" > "$STALE_CLAIM"
+echo "session_id=newsession" > "$FRESH_CLAIM"
+touch -t 202001010000 "$STALE_CLAIM" 2>/dev/null
+event_stop "sweep-$(date +%s)" "$PROJECT" | "$HOOKS/on_prompt_submit.sh" >/dev/null
+[ ! -f "$STALE_CLAIM" ] \
+  && pass "stale .claimed-* (>24h) deleted by sweep" \
+  || fail "stale .claimed-* not swept"
+[ -f "$FRESH_CLAIM" ] \
+  && pass "fresh .claimed-* preserved by sweep" \
+  || fail "fresh .claimed-* wrongly deleted"
+rm -f "$FRESH_CLAIM" 2>/dev/null
 
 printf '\n'
 if [ "$FAIL" = "0" ]; then
