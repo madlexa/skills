@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# niblet-apply-kimi — Kimi plugin wrapper for niblet-apply.
+#
+# Kimi passes all tool parameters as a single JSON object on stdin.
+# We extract `project_root` and `action`, then feed the action JSON
+# to the canonical niblet-apply via stdin.
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+
+INPUT="$(cat 2>/dev/null || true)"
+[ -n "$INPUT" ] || { echo "rejected: empty stdin" >&2; exit 64; }
+
+command -v jq >/dev/null 2>&1 || { echo "rejected: jq required" >&2; exit 70; }
+
+PROJECT_ROOT="$(printf '%s' "$INPUT" | jq -r '.project_root // empty')"
+ACTION_JSON="$(printf '%s' "$INPUT" | jq -c '.action // empty')"
+
+[ -n "$PROJECT_ROOT" ] || PROJECT_ROOT="${KIMI_PROJECT_ROOT:-}"
+[ -n "$PROJECT_ROOT" ] || {
+  PROJECT_ROOT="$(cd "$PWD" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")"
+  printf 'warning: niblet_apply did not receive project_root; falling back to detected cwd (%s). Pass an explicit project_root to write to the correct project.\n' "$PROJECT_ROOT" >&2
+}
+
+[ -n "$ACTION_JSON" ] && [ "$ACTION_JSON" != "null" ] || { echo "rejected: missing action JSON" >&2; exit 65; }
+
+# Force the Kimi runtime for global-scope artifacts. Project-scope artifacts
+# now live under .claude/ for both runtimes, but global memory/skills still
+# need the correct runtime home.
+(
+  export NIBLET_RUNTIME=kimi
+  printf '%s\n' "$ACTION_JSON" | "$SCRIPT_DIR/niblet-apply" --project-root "$PROJECT_ROOT"
+)

@@ -23,6 +23,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 . "$SCRIPT_DIR/../lib/paths.sh"
+. "$SCRIPT_DIR/../lib/config.sh"
 
 PROJECT_ROOT=""
 while [ $# -gt 0 ]; do
@@ -35,6 +36,8 @@ done
 
 [ -n "$PROJECT_ROOT" ] || PROJECT_ROOT="$(niblet_project_root "$PWD")"
 [ -d "$PROJECT_ROOT" ] || { printf 'niblet-status: not a directory: %s\n' "$PROJECT_ROOT" >&2; exit 66; }
+
+niblet_load_config "$PROJECT_ROOT"
 
 STORE="$(niblet_store "$PROJECT_ROOT")"
 KB_DIR="$(niblet_artifact_dir kb project "$PROJECT_ROOT")"
@@ -67,18 +70,41 @@ if [ -f "$STORE/session_count" ]; then
   case "$session_count" in *[!0-9]*) session_count=0 ;; esac
 fi
 
+# Artifact counts (promoted files under .claude/).
+_artifact_count() {
+  local dir="$1"
+  [ -d "$dir" ] || { printf '0'; return; }
+  find "$dir" -type f 2>/dev/null | wc -l | tr -d ' '
+}
+
+SKILLS_DIR="$(niblet_artifact_dir skills project "$PROJECT_ROOT" 2>/dev/null || true)"
+AGENTS_DIR="$(niblet_artifact_dir agents project "$PROJECT_ROOT" 2>/dev/null || true)"
+COMMANDS_DIR="$(niblet_artifact_dir commands project "$PROJECT_ROOT" 2>/dev/null || true)"
+SCRIPTS_DIR="$(niblet_artifact_dir scripts project "$PROJECT_ROOT" 2>/dev/null || true)"
+
+skills_count="$(_artifact_count "$SKILLS_DIR")"
+agents_count="$(_artifact_count "$AGENTS_DIR")"
+commands_count="$(_artifact_count "$COMMANDS_DIR")"
+scripts_count="$(_artifact_count "$SCRIPTS_DIR")"
+
 # ---- print ----
 printf 'niblet status: %s\n' "$PROJECT_ROOT"
 printf '\n'
+printf 'Configuration\n'
+printf '  Config path:    %s\n' "$PROJECT_ROOT/.niblet/config"
+printf '  Auto-promote:   %s\n' "${NIBLET_AUTO_PROMOTE:-0}"
+printf '\n'
 printf 'Knowledge base\n'
+printf '  KB path:        %s\n' "$KB_DIR"
 printf '  KB entries:     %s\n' "$kb_count"
+printf '  Memory path:    %s\n' "$MEM_DIR"
 printf '  Memory files:   %s\n' "$mem_count"
 
 printf '\n'
 printf 'Pending proposals: %s\n' "$proposal_count"
 if [ "$proposal_count" -gt 0 ] && [ -d "$PROPOSALS_DIR" ]; then
   # Action-type breakdown (count occurrences of "action: <TYPE>" in envelope).
-  awk '/^---$/{e++; next} e==1 && /^action:/{print $2; e=2}' \
+  awk 'FNR==1{e=0} /^---$/{e++; next} e==1 && /^action:/{print $2; e=2}' \
     "$PROPOSALS_DIR"/*.md 2>/dev/null \
     | sort | uniq -c | sort -rn \
     | while read -r cnt atype; do
@@ -100,6 +126,13 @@ elif [ -f "$IDX_FILE" ]; then
 else
   printf '  (artifact index not yet written)\n'
 fi
+
+printf '\n'
+printf 'Promoted artifact counts\n'
+printf '  skills:   %s\n' "$skills_count"
+printf '  agents:   %s\n' "$agents_count"
+printf '  commands: %s\n' "$commands_count"
+printf '  scripts:  %s\n' "$scripts_count"
 
 printf '\n'
 printf 'Queue depths\n'

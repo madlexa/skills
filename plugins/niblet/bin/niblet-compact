@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# niblet-compact — check KB/memory/artifact size/count thresholds and signal
+# when niblet-distill should run. This script is designed to be called by the
+# periodic cron maintenance prompt; it prints a machine-readable trigger block
+# if any threshold is exceeded.
+#
+# Usage:
+#   niblet-compact [--project-root <abs-path>]
+#
+# Thresholds are read from <project-root>/.niblet/config and can be overridden
+# by environment variables.
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+. "$SCRIPT_DIR/../lib/paths.sh"
+. "$SCRIPT_DIR/../lib/config.sh"
+
+PROJECT_ROOT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --project-root) PROJECT_ROOT="$2"; shift 2 ;;
+    -h|--help) printf 'Usage: %s [--project-root <abs-path>]\n' "${0##*/}"; exit 0 ;;
+    -*) printf 'unknown option: %s\n' "$1" >&2; exit 64 ;;
+    *) PROJECT_ROOT="$1"; shift ;;
+  esac
+done
+
+[ -n "$PROJECT_ROOT" ] || PROJECT_ROOT="$(niblet_project_root "$PWD")"
+[ -d "$PROJECT_ROOT" ] || { printf 'not a directory: %s\n' "$PROJECT_ROOT" >&2; exit 66; }
+
+niblet_load_config "$PROJECT_ROOT"
+
+KB_DIR="$(niblet_artifact_dir kb project "$PROJECT_ROOT" 2>/dev/null || true)"
+MEM_DIR="$(niblet_artifact_dir memory project "$PROJECT_ROOT" 2>/dev/null || true)"
+SKILLS_DIR="$(niblet_artifact_dir skills project "$PROJECT_ROOT" 2>/dev/null || true)"
+AGENTS_DIR="$(niblet_artifact_dir agents project "$PROJECT_ROOT" 2>/dev/null || true)"
+COMMANDS_DIR="$(niblet_artifact_dir commands project "$PROJECT_ROOT" 2>/dev/null || true)"
+SCRIPTS_DIR="$(niblet_artifact_dir scripts project "$PROJECT_ROOT" 2>/dev/null || true)"
+
+_count_files() {
+  local dir="$1"
+  [ -d "$dir" ] || { printf '0'; return; }
+  find "$dir" -type f 2>/dev/null | wc -l | tr -d ' '
+}
+
+_size_bytes() {
+  local dir="$1"
+  [ -d "$dir" ] || { printf '0'; return; }
+  find "$dir" -type f 2>/dev/null | while read -r f; do
+    wc -c < "$f" 2>/dev/null || true
+  done | awk '{s+=$1} END {printf "%d", s+0}'
+}
+
+kb_count="$(_count_files "$KB_DIR")"
+kb_size="$(_size_bytes "$KB_DIR")"
+mem_count="$(_count_files "$MEM_DIR")"
+
+artifact_count=0
+artifact_size=0
+for d in "$SKILLS_DIR" "$AGENTS_DIR" "$COMMANDS_DIR" "$SCRIPTS_DIR"; do
+  [ -d "$d" ] || continue
+  artifact_count=$((artifact_count + $(_count_files "$d")))
+  artifact_size=$((artifact_size + $(_size_bytes "$d")))
+done
+
+KB_DISTILL_COUNT="${NIBLET_KB_DISTILL_COUNT:-20}"
+KB_DISTILL_BYTES="${NIBLET_KB_DISTILL_BYTES:-200000}"
+ARTIFACT_COMPACT_COUNT="${NIBLET_ARTIFACT_COMPACT_COUNT:-20}"
+ARTIFACT_COMPACT_BYTES="${NIBLET_ARTIFACT_COMPACT_BYTES:-200000}"
+MEMORY_COMPACT_COUNT="${NIBLET_MEMORY_COMPACT_COUNT:-5}"
+
+triggered=0
+reasons=""
+
+_check() {
+  local name="$1" value="$2" threshold="$3"
+  if [ "$value" -gt "$threshold" ]; then
+    triggered=1
+    reasons="${reasons}${reasons:+, }${name}=${value} > ${threshold}"
+  fi
+}
+
+_check "kb_count" "$kb_count" "$KB_DISTILL_COUNT"
+_check "kb_bytes" "$kb_size" "$KB_DISTILL_BYTES"
+_check "memory_count" "$mem_count" "$MEMORY_COMPACT_COUNT"
+_check "artifact_count" "$artifact_count" "$ARTIFACT_COMPACT_COUNT"
+_check "artifact_bytes" "$artifact_size" "$ARTIFACT_COMPACT_BYTES"
+
+printf 'niblet-compact: %s\n' "$PROJECT_ROOT"
+printf '  kb_count=%s kb_bytes=%s\n' "$kb_count" "$kb_size"
+printf '  memory_count=%s\n' "$mem_count"
+printf '  artifact_count=%s artifact_bytes=%s\n' "$artifact_count" "$artifact_size"
+
+if [ "$triggered" = "1" ]; then
+  printf '\n<<<NIBLET COMPACT TRIGGER>>>\n'
+  printf 'reason: %s\n' "$reasons"
+  exit 0
+else
+  printf '\nNo thresholds exceeded.\n'
+  exit 0
+fi

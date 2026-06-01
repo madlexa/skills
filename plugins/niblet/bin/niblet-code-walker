@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# niblet-code-walker — invoke the code-walker sub-agent.
+#
+# Usage:
+#   niblet-code-walker [--project-root <abs-path>]
+#
+# Prints a reminder to the parent agent to spawn the niblet-code-walker
+# sub-agent with the correct inputs. The actual reasoning happens in the
+# agent prompt (plugins/niblet/agents/niblet-code-walker.md).
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+. "$SCRIPT_DIR/../lib/paths.sh"
+
+PROJECT_ROOT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --project-root) PROJECT_ROOT="$2"; shift 2 ;;
+    -h|--help) printf 'Usage: %s [--project-root <abs-path>]\n' "${0##*/}"; exit 0 ;;
+    -*) printf 'unknown option: %s\n' "$1" >&2; exit 64 ;;
+    *) PROJECT_ROOT="$1"; shift ;;
+  esac
+done
+
+[ -n "$PROJECT_ROOT" ] || PROJECT_ROOT="$(niblet_project_root "$PWD")"
+[ -d "$PROJECT_ROOT" ] || { printf 'not a directory: %s\n' "$PROJECT_ROOT" >&2; exit 66; }
+
+printf 'niblet-code-walker: spawn sub-agent with project_root=%s\n' "$PROJECT_ROOT"
+printf 'Agent prompt: %s/plugins/niblet/agents/niblet-code-walker.md\n' "$PROJECT_ROOT"

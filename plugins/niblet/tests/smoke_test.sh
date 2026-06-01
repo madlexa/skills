@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
-# smoke_test.sh — end-to-end test of niblet v0.2.1 contract.
+# smoke_test.sh — end-to-end test of niblet v0.4.2 contract.
 #
 # Tests security boundary + lifecycle, not just plumbing:
 #
 #   1. observe.sh auto-init + sanitized capture (no tool content)
-#   2. on_stop.sh per-session PENDING_FAST + counter
+#   2. on_stop.sh per-session PENDING_FAST on edit turns + counter
 #   3. on_prompt_submit.sh FAST reminder for own session
 #   4. Stop ×5 does NOT escalate to DEEP (default threshold 20)
-#   5. on_session_end.sh writes a project-wide queue entry
+#   5. on_session_end.sh writes a queue entry for a session that did real work
 #   6. DEEP reminder reaches a NEW session id (cross-session delivery)
 #   7. Safety-net at low threshold writes queue entry, resets counter
+#   ...
+#   61. DEEP enqueue gated below NIBLET_DEEP_MIN_TOOLCALLS (+ override)
+#   62. FAST marker gated on file mutations (non-edit turn → no PENDING_FAST)
+#   63. stale .claimed-* swept, fresh claim preserved
 #   8. niblet-apply rejects path traversal in topic → proposal, CLAUDE.md untouched
 #   9. niblet-apply rejects path traversal in name (CREATE_SKILL)
 #   10. niblet-apply auto-writes ADD_KB_ENTRY when slug is valid
@@ -45,6 +49,20 @@ event_bash_with_secret() {
 event_stop() {
   local session="$1" cwd="$2"
   jq -nc --arg s "$session" --arg c "$cwd" '{session_id:$s, cwd:$c}'
+}
+event_write_file() {
+  local session="$1" cwd="$2" path="$3"
+  jq -nc --arg s "$session" --arg c "$cwd" --arg p "$path" \
+    '{session_id:$s, tool_name:"Write", cwd:$c, tool_input:{file_path:$p, content:"x"}, tool_response:{success:true}}'
+}
+# Seed N sanitized tool-call (post) events into a session's raw log so it clears
+# the DEEP enqueue gate (NIBLET_DEEP_MIN_TOOLCALLS). Uses Read events (no edits).
+seed_toolcalls() {
+  local session="$1" cwd="$2" n="$3" i=0
+  while [ "$i" -lt "$n" ]; do
+    event_read_with_secret "$session" "$cwd" "$cwd/src/seed$i.ts" | "$HOOKS/observe.sh" post >/dev/null
+    i=$((i + 1))
+  done
 }
 
 # Build action JSON safely via jq
@@ -95,9 +113,12 @@ fi
     && fail "root .gitignore was modified with .niblet/ entry — regression!" \
     || pass "root .gitignore exists but does NOT contain .niblet/ entry"; }
 
-title "2. on_stop.sh per-session PENDING_FAST + counter"
+title "2. on_stop.sh per-session PENDING_FAST (on edit turn) + counter"
+# v0.3.1: PENDING_FAST is gated on real file mutations. Record a Write event so
+# this turn qualifies as an edit turn and the marker is set.
+event_write_file "$SESSION_A" "$PROJECT" "$PROJECT/src/foo.ts" | "$HOOKS/observe.sh" post >/dev/null
 event_stop "$SESSION_A" "$PROJECT" | "$HOOKS/on_stop.sh" >/dev/null
-[ -f "$A_DIR/PENDING_FAST" ] && pass "PENDING_FAST per-session" || fail "no PENDING_FAST"
+[ -f "$A_DIR/PENDING_FAST" ] && pass "PENDING_FAST set on edit turn" || fail "no PENDING_FAST"
 [ "$(cat "$A_DIR/task_counter")" = "1" ] && pass "counter=1" || fail "counter wrong"
 
 title "3. on_prompt_submit FAST reminder mentions niblet-apply"
@@ -117,7 +138,10 @@ QUEUE_COUNT="$(find "$STORE/pending_deep" -maxdepth 1 -type f 2>/dev/null | wc -
 [ "$QUEUE_COUNT" = "0" ] && pass "no DEEP queue entry at 5 turns" \
   || fail "DEEP queue grew unexpectedly: $QUEUE_COUNT"
 
-title "5. on_session_end writes a project-wide queue entry"
+title "5. on_session_end writes a project-wide queue entry (session did real work)"
+# v0.3.1: DEEP enqueue is gated on >= NIBLET_DEEP_MIN_TOOLCALLS (default 8) tool
+# calls. Seed enough so this real session clears the gate.
+seed_toolcalls "$SESSION_A" "$PROJECT" 8
 event_stop "$SESSION_A" "$PROJECT" | "$HOOKS/on_session_end.sh" >/dev/null
 QUEUE_COUNT="$(find "$STORE/pending_deep" -maxdepth 1 -type f -name '*.queue' 2>/dev/null | wc -l | tr -d ' ')"
 [ "$QUEUE_COUNT" -ge "1" ] && pass "queue entry created" || fail "no queue file"
@@ -176,6 +200,9 @@ echo "$OUT_B" | grep -qE "${QUEUE_PREFIX}\.claimed-" \
 
 title "7. Safety-net writes queue entry, resets counter"
 SESSION_C="marathon-$(date +%s)"
+# v0.3.1: safety-net enqueue is also gated on real work. Seed tool calls so the
+# marathon session clears the gate when the turn counter trips the threshold.
+seed_toolcalls "$SESSION_C" "$PROJECT" 8
 export NIBLET_DEEP_THRESHOLD=3
 for i in 1 2 3; do
   event_stop "$SESSION_C" "$PROJECT" | "$HOOKS/on_stop.sh" >/dev/null
@@ -360,11 +387,10 @@ else
 fi
 
 title "18. niblet-promote works under Kimi runtime"
-# Stage a CREATE_SKILL proposal authored for the Kimi runtime. Under Kimi,
-# artifact_dir returns .kimi/skills/niblet/<name>/SKILL.md. The proposal's
-# 'target' field encodes that. niblet-promote must use niblet_artifact_dir
-# for containment, NOT a hardcoded ".claude" path.
-KIMI_TARGET="$PROJECT/.kimi/skills/niblet/kimi-skill/SKILL.md"
+# Project-scope artifacts are now shared under .claude/ for both runtimes.
+# The proposal's 'target' field must reflect .claude/skills/niblet/... and
+# niblet-promote must accept it under the Kimi runtime.
+KIMI_TARGET="$PROJECT/.claude/skills/niblet/kimi-skill/SKILL.md"
 KIMI_PROPOSAL="$STORE/proposals/test-kimi.md"
 {
   echo "---"
@@ -382,7 +408,7 @@ KIMI_PROPOSAL="$STORE/proposals/test-kimi.md"
 } > "$KIMI_PROPOSAL"
 # Run promote with KIMI_SESSION set so niblet_runtime returns "kimi".
 ( cd "$PROJECT" && KIMI_SESSION=1 "$BIN/niblet-promote" "$KIMI_PROPOSAL" >/dev/null )
-[ -f "$KIMI_TARGET" ] && pass "Kimi promote landed file under .kimi/" \
+[ -f "$KIMI_TARGET" ] && pass "Kimi promote landed file under .claude/" \
   || fail "Kimi promote did NOT write $KIMI_TARGET (artifact_dir/runtime broken)"
 
 title "19. proposal filename collision avoided"
@@ -419,6 +445,8 @@ grep -q "NIBLET CHECKPOINT (deep)" "$PAR2_OUT" && DEEP_HITS=$((DEEP_HITS+1))
 [ "$DEEP_HITS" -eq 1 ] \
   && pass "exactly one of two parallel hooks won the queue claim" \
   || fail "race condition: $DEEP_HITS hooks both emitted DEEP (or zero)"
+# Clean up the parallel queue entry so later tests don't see a stale DEEP claim.
+rm -f "$SAFE_QUEUE" "${SAFE_QUEUE%.queue}".claimed-* 2>/dev/null || true
 
 title "21. SessionStart surfaces memory feedback alongside KB"
 mkdir -p "$PROJECT/.claude/memory"
@@ -1007,6 +1035,35 @@ printf '%s\n' "$STATUS_OUT" | grep -qi "next steps" \
   && pass "niblet-status output includes next steps section" \
   || fail "niblet-status output missing next steps section"
 
+# Seed extra proposal types to verify the awk breakdown does not leak state.
+STATUS_AUDIT_PROP="$STORE/proposals/status-audit-test.md"
+STATUS_SKILL_PROP="$STORE/proposals/status-skill-test.md"
+{
+  echo "---"
+  echo "action: AUDIT_REPORT"
+  echo "scope: project"
+  echo "created: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "---"
+  echo "status audit test body"
+} > "$STATUS_AUDIT_PROP"
+{
+  echo "---"
+  echo "action: CREATE_SKILL"
+  echo "scope: project"
+  echo "name: status-skill-test"
+  echo "created: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "---"
+  echo "status skill test body"
+} > "$STATUS_SKILL_PROP"
+STATUS_OUT2="$("$BIN/niblet-status" --project-root "$PROJECT"; echo "EXIT:$?")"
+printf '%s\n' "$STATUS_OUT2" | grep -q 'CREATE_SKILL' \
+  && pass "niblet-status breakdown lists CREATE_SKILL" \
+  || fail "niblet-status missing CREATE_SKILL breakdown"
+printf '%s\n' "$STATUS_OUT2" | grep -q 'AUDIT_REPORT' \
+  && pass "niblet-status breakdown lists AUDIT_REPORT" \
+  || fail "niblet-status missing AUDIT_REPORT breakdown"
+rm -f "$STATUS_AUDIT_PROP" "$STATUS_SKILL_PROP"
+
 title "47. niblet-status: no file content leaked in output"
 # The status command must never emit file content from KB or memory.
 # Use known content written in earlier tests.
@@ -1347,6 +1404,175 @@ else
   fail "reason: check skipped — no proposal file"
   fail "evidence: check skipped — no proposal file"
 fi
+
+title "61. DEEP enqueue gated: trivial session (< MIN_TC tool calls) writes NO queue"
+# v0.3.1: breaks the self-perpetuating queue. A session below the tool-call
+# threshold must not seed a DEEP job for the next session.
+GATE_SESSION="gate-$(date +%s)"
+seed_toolcalls "$GATE_SESSION" "$PROJECT" 3   # 3 < default 8
+event_stop "$GATE_SESSION" "$PROJECT" | "$HOOKS/on_session_end.sh" >/dev/null
+GATE_Q="$(find "$STORE/pending_deep" -maxdepth 1 -type f -name "*-${GATE_SESSION}.queue" 2>/dev/null | wc -l | tr -d ' ')"
+[ "$GATE_Q" = "0" ] \
+  && pass "trivial session did NOT enqueue a DEEP job (gate works)" \
+  || fail "trivial session enqueued a DEEP job — gate broken"
+# And the override restores old behavior.
+GATE_SESSION2="gate2-$(date +%s)"
+seed_toolcalls "$GATE_SESSION2" "$PROJECT" 3
+event_stop "$GATE_SESSION2" "$PROJECT" | NIBLET_DEEP_MIN_TOOLCALLS=0 "$HOOKS/on_session_end.sh" >/dev/null
+GATE_Q2="$(find "$STORE/pending_deep" -maxdepth 1 -type f -name "*-${GATE_SESSION2}.queue" 2>/dev/null | wc -l | tr -d ' ')"
+[ "$GATE_Q2" -ge "1" ] \
+  && pass "NIBLET_DEEP_MIN_TOOLCALLS=0 restores unconditional enqueue" \
+  || fail "override did not restore unconditional enqueue"
+
+title "62. FAST marker gated: non-edit turn writes NO PENDING_FAST"
+# v0.3.1: PENDING_FAST only on turns that mutated project files.
+FG_SESSION="fastgate-$(date +%s)"
+seed_toolcalls "$FG_SESSION" "$PROJECT" 2   # Read events only — no edits
+FG_DIR="$STORE/sessions/$FG_SESSION"
+rm -f "$FG_DIR/PENDING_FAST" "$FG_DIR/fast_seen" 2>/dev/null
+event_stop "$FG_SESSION" "$PROJECT" | "$HOOKS/on_stop.sh" >/dev/null
+[ ! -f "$FG_DIR/PENDING_FAST" ] \
+  && pass "no PENDING_FAST on a non-edit turn (FAST gate works)" \
+  || fail "PENDING_FAST set on a non-edit turn — FAST gate broken"
+# Now an edit turn DOES set it.
+event_write_file "$FG_SESSION" "$PROJECT" "$PROJECT/src/edited.ts" | "$HOOKS/observe.sh" post >/dev/null
+event_stop "$FG_SESSION" "$PROJECT" | "$HOOKS/on_stop.sh" >/dev/null
+[ -f "$FG_DIR/PENDING_FAST" ] \
+  && pass "PENDING_FAST set once the turn edits a file" \
+  || fail "PENDING_FAST not set on an edit turn"
+
+title "63. stale .claimed-* swept, fresh claim preserved (on_prompt_submit)"
+SWEEP_DIR="$STORE/pending_deep"
+mkdir -p "$SWEEP_DIR"
+STALE_CLAIM="$SWEEP_DIR/20200101T000000Z-oldsession.claimed-deadsession"
+FRESH_CLAIM="$SWEEP_DIR/$(date -u +%Y%m%dT%H%M%SZ)-newsession.claimed-livesession"
+echo "session_id=oldsession" > "$STALE_CLAIM"
+echo "session_id=newsession" > "$FRESH_CLAIM"
+touch -t 202001010000 "$STALE_CLAIM" 2>/dev/null
+event_stop "sweep-$(date +%s)" "$PROJECT" | "$HOOKS/on_prompt_submit.sh" >/dev/null
+[ ! -f "$STALE_CLAIM" ] \
+  && pass "stale .claimed-* (>24h) deleted by sweep" \
+  || fail "stale .claimed-* not swept"
+[ -f "$FRESH_CLAIM" ] \
+  && pass "fresh .claimed-* preserved by sweep" \
+  || fail "fresh .claimed-* wrongly deleted"
+rm -f "$FRESH_CLAIM" 2>/dev/null
+
+title "64. niblet-log appends sanitized event to raw JSONL"
+LOG_SESSION="log-session-$(date +%s)"
+jq -nc --arg s "$LOG_SESSION" --arg p "src/logged.ts" --arg pr "$PROJECT" \
+  '{session_id:$s, tool:"WriteFile", path:$p, exit_code:"", success:true, project_root:$pr}' \
+  | "$BIN/niblet-log" >/dev/null
+LOG_RAW="$STORE/raw/${LOG_SESSION}.jsonl"
+[ -f "$LOG_RAW" ] && pass "raw log file created by niblet-log" \
+  || fail "niblet-log did not create raw log"
+grep -q '"tool":"WriteFile"' "$LOG_RAW" && pass "tool name recorded" \
+  || fail "tool name missing"
+grep -q '"path":"src/logged.ts"' "$LOG_RAW" && pass "project-relative path recorded" \
+  || fail "path missing or wrong"
+# Secrets must NOT leak even if passed
+echo "SECRET=leak" | jq -Rnc --arg s "$LOG_SESSION" --arg pr "$PROJECT" \
+  '{session_id:$s, tool:"Bash", path:"", exit_code:"0", success:true, project_root:$pr, secret:input}' \
+  | "$BIN/niblet-log" >/dev/null
+grep -q "SECRET=leak" "$LOG_RAW" \
+  && fail "secret leaked into raw log" \
+  || pass "no secret leaked"
+
+title "65. niblet-apply under Kimi runtime writes to .claude/kb/"
+KIMI_PROJECT="$TMP/kimi-project"
+mkdir -p "$KIMI_PROJECT"
+( cd "$KIMI_PROJECT" && git init -q && git config user.email t@t && git config user.name t )
+KIMI_STORE="$KIMI_PROJECT/.niblet"
+mkdir -p "$KIMI_STORE/inbox"
+jq -nc --arg t "kimi-topic.md" --arg c "# Kimi KB" \
+  '{action:"ADD_KB_ENTRY", scope:"project", topic:$t, content:$c}' \
+  | KIMI_SESSION=1 "$BIN/niblet-apply" --project-root "$KIMI_PROJECT" >/dev/null
+[ -f "$KIMI_PROJECT/.claude/kb/kimi-topic.md" ] && pass "KB written under .claude/ when KIMI_SESSION set" \
+  || fail "KB not found under .claude/kb/"
+[ ! -f "$KIMI_PROJECT/.kimi/kb/kimi-topic.md" ] && pass "KB NOT written under .kimi/" \
+  || fail "KB incorrectly written to .kimi/ under Kimi runtime"
+
+title "66. niblet-status under Kimi runtime reports .claude/ paths"
+KIMI_STATUS_OUT="$(KIMI_SESSION=1 "$BIN/niblet-status" "$KIMI_PROJECT")"
+echo "$KIMI_STATUS_OUT" | grep -q ".claude" && pass "status mentions .claude paths" \
+  || fail "status missing .claude paths under Kimi runtime"
+
+title "67. niblet-apply UPDATE_MEMORY interruption template"
+KIMI_MEM="$KIMI_PROJECT/.claude/memory/feedback_interruptions.md"
+jq -nc --arg f "feedback_interruptions.md" --arg c "- 2026-06-11: User stopped because wrong approach" \
+  '{action:"UPDATE_MEMORY", scope:"project", file:$f, content:$c}' \
+  | KIMI_SESSION=1 "$BIN/niblet-apply" --project-root "$KIMI_PROJECT" >/dev/null
+[ -f "$KIMI_MEM" ] && pass "interruption memory written under .claude/memory/" \
+  || fail "interruption memory missing"
+grep -q "wrong approach" "$KIMI_MEM" && pass "interruption content preserved" \
+  || fail "interruption content wrong"
+
+title "68. niblet-apply-kimi forces .claude/ without KIMI_SESSION"
+# The wrapper sets NIBLET_RUNTIME=kimi for global artifacts, but project-scope
+# artifacts now live under .claude/ for both runtimes.
+unset KIMI_SESSION KIMI_HOME KIMI_WORK_DIR
+FORCED_KB="$KIMI_PROJECT/.claude/kb/forced-kimi.md"
+jq -nc --arg pr "$KIMI_PROJECT" --arg t "forced-kimi.md" --arg c "# Forced" \
+  '{project_root:$pr, action:{action:"ADD_KB_ENTRY", scope:"project", topic:$t, content:$c}}' \
+  | "$BIN/niblet-apply-kimi" >/dev/null
+[ -f "$FORCED_KB" ] && pass "Kimi wrapper wrote KB under .claude/ without KIMI_SESSION" \
+  || fail "Kimi wrapper did NOT write under .claude/"
+[ ! -f "$KIMI_PROJECT/.kimi/kb/forced-kimi.md" ] && pass "Kimi wrapper did NOT write under .kimi/" \
+  || fail "Kimi wrapper incorrectly wrote under .kimi/"
+
+title "69. niblet-apply UPDATE_MEMORY appends instead of overwriting"
+MEM_APPEND="$PROJECT/.claude/memory/feedback_append.md"
+FIRST_BODY="$(printf -- '---\nname: feedback-append\ndescription: Test\n---\n\n- first bullet')"
+SECOND_BODY="$(printf -- '---\nname: feedback-append\ndescription: Test\n---\n\n- second bullet')"
+jq -nc --arg f "feedback_append.md" --arg c "$FIRST_BODY" \
+  '{action:"UPDATE_MEMORY", scope:"project", file:$f, content:$c}' \
+  | "$BIN/niblet-apply" --project-root "$PROJECT" >/dev/null
+jq -nc --arg f "feedback_append.md" --arg c "$SECOND_BODY" \
+  '{action:"UPDATE_MEMORY", scope:"project", file:$f, content:$c}' \
+  | "$BIN/niblet-apply" --project-root "$PROJECT" >/dev/null
+[ -f "$MEM_APPEND" ] && pass "append memory file exists" || fail "append memory file missing"
+BULLET_COUNT="$(grep -c '^- ' "$MEM_APPEND" 2>/dev/null || echo 0)"
+[ "$BULLET_COUNT" -eq 2 ] && pass "UPDATE_MEMORY appended both bullets (count=$BULLET_COUNT)" \
+  || fail "UPDATE_MEMORY overwrote instead of appending (count=$BULLET_COUNT)"
+
+title "70. niblet-apply UPDATE_AGENTS → proposal; promote appends to AGENTS.md"
+action_update_agents() {
+  jq -nc --arg s "Conventions" --arg a "Respect the AGENTS.md conventions." \
+    '{action:"UPDATE_AGENTS", scope:"project", section:$s, addition:$a}'
+}
+action_update_agents | "$BIN/niblet-apply" --project-root "$PROJECT" >/dev/null
+AGENTS_PROP="$(grep -rl 'action: UPDATE_AGENTS' "$STORE/proposals" 2>/dev/null | head -n1)"
+[ -n "$AGENTS_PROP" ] && pass "UPDATE_AGENTS proposal created" || fail "no UPDATE_AGENTS proposal found"
+printf '# Project AGENTS\n\n## Conventions\nExisting agents rule.\n' > "$PROJECT/AGENTS.md"
+( cd "$PROJECT" && "$BIN/niblet-promote" "$AGENTS_PROP" >/dev/null )
+grep -q "Respect the AGENTS.md conventions." "$PROJECT/AGENTS.md" \
+  && pass "UPDATE_AGENTS addition appended to AGENTS.md" \
+  || fail "UPDATE_AGENTS addition missing from AGENTS.md"
+grep -q "Existing agents rule." "$PROJECT/AGENTS.md" \
+  && pass "existing AGENTS.md content preserved" \
+  || fail "UPDATE_AGENTS promote overwrote existing AGENTS.md content"
+
+title "71. on_prompt_submit urgent FAST elevates feedback over DEEP"
+URGENT_SESSION="urgent-$(date +%s)"
+# Seed a DEEP queue entry so we can prove FAST wins.
+URGENT_QUEUE="$STORE/pending_deep/zzurgent-$(date -u +%Y%m%dT%H%M%SZ).queue"
+{ echo "session_id=urgent-deep"; echo "raw_log=$STORE/raw/urgent-deep.jsonl"; echo "turns=1"; } > "$URGENT_QUEUE"
+OUT_URGENT="$(jq -nc --arg s "$URGENT_SESSION" --arg c "$PROJECT" --arg p "wtf, this is wrong" \
+  '{session_id:$s, cwd:$c, prompt:$p}' | "$HOOKS/on_prompt_submit.sh")"
+echo "$OUT_URGENT" | grep -q "NIBLET CHECKPOINT (fast)" \
+  && pass "urgent prompt emitted FAST checkpoint" \
+  || fail "urgent prompt did NOT emit FAST: $(echo "$OUT_URGENT" | head -n3)"
+echo "$OUT_URGENT" | grep -q "URGENT" \
+  && pass "FAST reminder marked URGENT" || fail "FAST reminder not marked URGENT"
+echo "$OUT_URGENT" | grep -q "NIBLET CHECKPOINT (deep)" \
+  && fail "DEEP was emitted despite urgent FAST priority" \
+  || pass "DEEP suppressed by urgent FAST"
+[ -f "$STORE/sessions/$URGENT_SESSION/PENDING_FAST" ] \
+  && pass "urgent FAST created PENDING_FAST marker" \
+  || fail "PENDING_FAST marker missing for urgent session"
+# The DEEP queue entry should have been released back to its .queue name.
+[ -f "$URGENT_QUEUE" ] && pass "DEEP queue entry released back to queue" \
+  || fail "urgent FAST did not release DEEP queue entry"
 
 printf '\n'
 if [ "$FAIL" = "0" ]; then

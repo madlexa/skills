@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# niblet-wrap-up — concise end-of-task maintenance check.
+#
+# Usage:
+#   niblet-wrap-up [--project-root <abs-path>]
+#
+# Runs deterministic checks and prints suggestions for sub-agent work.
+# Designed to be called at the end of a non-trivial task, not on a timer.
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+. "$SCRIPT_DIR/../lib/paths.sh"
+. "$SCRIPT_DIR/../lib/config.sh"
+
+PROJECT_ROOT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --project-root) PROJECT_ROOT="$2"; shift 2 ;;
+    -h|--help) printf 'Usage: %s [--project-root <abs-path>]\n' "${0##*/}"; exit 0 ;;
+    -*) printf 'unknown option: %s\n' "$1" >&2; exit 64 ;;
+    *) PROJECT_ROOT="$1"; shift ;;
+  esac
+done
+
+[ -n "$PROJECT_ROOT" ] || PROJECT_ROOT="$(niblet_project_root "$PWD")"
+[ -d "$PROJECT_ROOT" ] || { printf 'not a directory: %s\n' "$PROJECT_ROOT" >&2; exit 66; }
+
+niblet_load_config "$PROJECT_ROOT"
+
+STORE="$(niblet_store "$PROJECT_ROOT")"
+MARKER="$STORE/.code-walker-last-run"
+KB_DIR="$(niblet_artifact_dir kb project "$PROJECT_ROOT" 2>/dev/null || true)"
+MEM_DIR="$(niblet_artifact_dir memory project "$PROJECT_ROOT" 2>/dev/null || true)"
+SKILLS_DIR="$(niblet_artifact_dir skills project "$PROJECT_ROOT" 2>/dev/null || true)"
+AGENTS_DIR="$(niblet_artifact_dir agents project "$PROJECT_ROOT" 2>/dev/null || true)"
+COMMANDS_DIR="$(niblet_artifact_dir commands project "$PROJECT_ROOT" 2>/dev/null || true)"
+SCRIPTS_DIR="$(niblet_artifact_dir scripts project "$PROJECT_ROOT" 2>/dev/null || true)"
+
+_count() {
+  local dir="$1"
+  [ -d "$dir" ] || { printf '0'; return; }
+  find "$dir" -type f 2>/dev/null | wc -l | tr -d ' '
+}
+
+_size() {
+  local dir="$1"
+  [ -d "$dir" ] || { printf '0'; return; }
+  find "$dir" -type f 2>/dev/null | while read -r f; do wc -c < "$f" 2>/dev/null || true; done | awk '{s+=$1} END {printf "%d", s+0}'
+}
+
+kb_count="$(_count "$KB_DIR")"
+kb_size="$(_size "$KB_DIR")"
+mem_count="$(_count "$MEM_DIR")"
+proposal_count=0
+[ -d "$STORE/proposals" ] && proposal_count="$(find "$STORE/proposals" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
+distill_count=0
+[ -d "$STORE/distill_queue" ] && distill_count="$(find "$STORE/distill_queue" -maxdepth 1 -type f -name '*.distill' 2>/dev/null | wc -l | tr -d ' ')"
+audit_count=0
+[ -d "$STORE/audit_queue" ] && audit_count="$(find "$STORE/audit_queue" -maxdepth 1 -type f -name '*.audit' 2>/dev/null | wc -l | tr -d ' ')"
+deep_count=0
+[ -d "$STORE/pending_deep" ] && deep_count="$(find "$STORE/pending_deep" -maxdepth 1 -type f -name '*.queue' 2>/dev/null | wc -l | tr -d ' ')"
+
+artifact_count=0
+artifact_size=0
+for d in "$SKILLS_DIR" "$AGENTS_DIR" "$COMMANDS_DIR" "$SCRIPTS_DIR"; do
+  [ -d "$d" ] || continue
+  artifact_count=$((artifact_count + $(_count "$d")))
+  artifact_size=$((artifact_size + $(_size "$d")))
+done
+
+KB_DISTILL_COUNT="${NIBLET_KB_DISTILL_COUNT:-20}"
+KB_DISTILL_BYTES="${NIBLET_KB_DISTILL_BYTES:-200000}"
+ARTIFACT_COMPACT_COUNT="${NIBLET_ARTIFACT_COMPACT_COUNT:-20}"
+ARTIFACT_COMPACT_BYTES="${NIBLET_ARTIFACT_COMPACT_BYTES:-200000}"
+MEMORY_COMPACT_COUNT="${NIBLET_MEMORY_COMPACT_COUNT:-5}"
+
+code_walker_needed=0
+if [ -f "$MARKER" ]; then
+  changed_files="$(find "$PROJECT_ROOT/plugins" "$PROJECT_ROOT/docs" "$PROJECT_ROOT/.claude-plugin" "$PROJECT_ROOT/README.md" -type f -newer "$MARKER" 2>/dev/null | head -1 || true)"
+  [ -n "$changed_files" ] && code_walker_needed=1
+else
+  code_walker_needed=1
+fi
+
+printf 'niblet-wrap-up: %s\n' "$PROJECT_ROOT"
+printf '  KB: %s entries / %s bytes | memory: %s | proposals: %s | queues: deep=%s audit=%s distill=%s\n' \
+  "$kb_count" "$kb_size" "$mem_count" "$proposal_count" "$deep_count" "$audit_count" "$distill_count"
+
+# Run gardener and capture summary.
+gardener_out="$("$SCRIPT_DIR/niblet-skill-gardener" --project-root "$PROJECT_ROOT" 2>&1)"
+promoted="$(printf '%s\n' "$gardener_out" | awk '/^promoted:/{print $2}')"
+would="$(printf '%s\n' "$gardener_out" | awk '/^would-promote:/{print $2}')"
+skipped="$(printf '%s\n' "$gardener_out" | awk '/^skipped:/{print $2}')"
+printf '  gardener: promoted=%s would-promote=%s skipped=%s\n' "${promoted:-0}" "${would:-0}" "${skipped:-0}"
+
+# Build suggestions.
+suggestions=""
+
+if [ "$code_walker_needed" = "1" ]; then
+  suggestions="${suggestions}- Source files changed since last walk. Run: niblet-code-walker --project-root $PROJECT_ROOT; then touch $MARKER\n"
+fi
+
+if [ "$kb_count" -gt "$KB_DISTILL_COUNT" ] || [ "$kb_size" -gt "$KB_DISTILL_BYTES" ]; then
+  suggestions="${suggestions}- KB threshold exceeded ($kb_count > $KB_DISTILL_COUNT or $kb_size > $KB_DISTILL_BYTES bytes). Run: spawn niblet-distill\n"
+fi
+if [ "$mem_count" -gt "$MEMORY_COMPACT_COUNT" ]; then
+  suggestions="${suggestions}- Memory threshold exceeded ($mem_count > $MEMORY_COMPACT_COUNT). Run: spawn niblet-distill\n"
+fi
+if [ "$artifact_count" -gt "$ARTIFACT_COMPACT_COUNT" ] || [ "$artifact_size" -gt "$ARTIFACT_COMPACT_BYTES" ]; then
+  suggestions="${suggestions}- Artifact threshold exceeded ($artifact_count > $ARTIFACT_COMPACT_COUNT or $artifact_size > $ARTIFACT_COMPACT_BYTES bytes). Run: spawn niblet-distill\n"
+fi
+
+if [ "$deep_count" -gt 0 ]; then
+  suggestions="${suggestions}- Deep queue has $deep_count pending entry(ies). Run: spawn niblet-deep\n"
+fi
+if [ "$audit_count" -gt 0 ]; then
+  suggestions="${suggestions}- Audit queue has $audit_count pending entry(ies). Run: spawn niblet-audit\n"
+fi
+if [ "$distill_count" -gt 0 ]; then
+  suggestions="${suggestions}- Distill queue has $distill_count pending entry(ies). Run: spawn niblet-distill\n"
+fi
+
+if [ -n "$suggestions" ]; then
+  printf '\nSuggested next actions:\n%s' "$suggestions"
+else
+  printf '\nNo wrap-up actions required.\n'
+fi
+
+exit 0

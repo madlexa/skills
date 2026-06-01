@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# niblet-promote-kimi — Kimi plugin wrapper for niblet-promote.
+#
+# Extracts proposal_file and optional project_root from stdin JSON params.
+
+set -e
+
+# Force Kimi runtime so promotion targets .kimi/ instead of .claude/.
+export NIBLET_RUNTIME=kimi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+
+INPUT="$(cat 2>/dev/null || true)"
+[ -n "$INPUT" ] || { echo "rejected: empty stdin" >&2; exit 64; }
+
+command -v jq >/dev/null 2>&1 || { echo "rejected: jq required" >&2; exit 70; }
+
+PROPOSAL_FILE="$(printf '%s' "$INPUT" | jq -r '.proposal_file // empty')"
+PROJECT_ROOT="$(printf '%s' "$INPUT" | jq -r '.project_root // empty')"
+
+[ -n "$PROPOSAL_FILE" ] || { echo "rejected: missing proposal_file" >&2; exit 65; }
+[ -n "$PROJECT_ROOT" ] || PROJECT_ROOT="${KIMI_PROJECT_ROOT:-}"
+[ -n "$PROJECT_ROOT" ] || {
+  PROJECT_ROOT="$(cd "$PWD" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")"
+  printf 'warning: niblet_promote did not receive project_root; falling back to detected cwd (%s). Pass an explicit project_root to promote into the correct project.\n' "$PROJECT_ROOT" >&2
+}
+
+# niblet-promote does not accept --project-root for normal promotion; run it
+# from the project root so relative targets and containment checks resolve
+# correctly.
+cd "$PROJECT_ROOT" && "$SCRIPT_DIR/niblet-promote" "$PROPOSAL_FILE"

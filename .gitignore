@@ -2,7 +2,11 @@
 *.swp
 *.swo
 *~
-.idea/
-.vscode/
+/.idea/
+/.vscode/
 node_modules/
-.niblet/
+/.niblet/
+/.claude/kb
+*.niblet-backup
+/docs/
+/knowledge/

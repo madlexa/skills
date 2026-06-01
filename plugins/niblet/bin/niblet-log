@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# niblet-log — Kimi plugin tool: append a sanitized event to the raw JSONL log.
+#
+# Replaces the Claude-only observe.sh hook. Called explicitly by the agent
+# after file-mutating tools (WriteFile, StrReplaceFile) per the niblet skill.
+#
+# Input (JSON via stdin):
+#   {
+#     "project_root": "/abs/path/to/project",
+#     "session_id": "<uuid>",
+#     "tool": "WriteFile",
+#     "path": "src/main.py",
+#     "exit_code": "",
+#     "success": true
+#   }
+#
+# Output: nothing on success, or error text to stderr.
+
+set -e
+
+# Force Kimi runtime: this tool is only ever used by Kimi Code CLI (via the
+# MCP server or the legacy skill), so writes must always land under .kimi/.
+export NIBLET_RUNTIME=kimi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+. "$SCRIPT_DIR/../lib/paths.sh"
+. "$SCRIPT_DIR/../lib/store.sh"
+. "$SCRIPT_DIR/../lib/sanitize.sh"
+. "$SCRIPT_DIR/../lib/jsonl.sh"
+
+INPUT="$(cat 2>/dev/null || true)"
+[ -n "$INPUT" ] || { echo "rejected: empty stdin" >&2; exit 64; }
+
+command -v jq >/dev/null 2>&1 || { echo "rejected: jq required" >&2; exit 70; }
+
+SESSION="$(printf '%s' "$INPUT" | jq -r '.session_id // empty')"
+TOOL="$(printf '%s' "$INPUT" | jq -r '.tool // empty')"
+SAFE_PATH="$(printf '%s' "$INPUT" | jq -r '.path // empty')"
+EXIT_CODE="$(printf '%s' "$INPUT" | jq -r '.exit_code // empty')"
+SUCCESS="$(printf '%s' "$INPUT" | jq -r '.success // true')"
+PROJECT_ROOT="$(printf '%s' "$INPUT" | jq -r '.project_root // empty')"
+
+[ -n "$SESSION" ] || { echo "rejected: missing session_id" >&2; exit 65; }
+[ -n "$TOOL" ]    || { echo "rejected: missing tool" >&2; exit 65; }
+
+[ -n "$PROJECT_ROOT" ] || PROJECT_ROOT="${KIMI_PROJECT_ROOT:-}"
+[ -n "$PROJECT_ROOT" ] || {
+  PROJECT_ROOT="$(niblet_project_root "$PWD")"
+  printf 'warning: niblet_log did not receive project_root; falling back to detected cwd (%s). Pass an explicit project_root to associate logs with the correct project.\n' "$PROJECT_ROOT" >&2
+}
+
+STORE="$(niblet_ensure_store "$PROJECT_ROOT" "$SESSION")"
+[ -n "$STORE" ] || { echo "rejected: cannot resolve store" >&2; exit 66; }
+
+# Sanitize path: project-relative when possible.
+SAFE_PATH="$(niblet_project_relative_path "$PROJECT_ROOT" "$SAFE_PATH")"
+
+# Build event JSON manually (same contract as observe.sh).
+TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+EVENT="$(printf '{"ts":"%s","session":"%s","phase":"%s","tool":"%s","path":"%s","exit_code":"%s","success":%s}' \
+  "$TS" \
+  "$(jsonl_escape "$SESSION")" \
+  "post" \
+  "$(jsonl_escape "$TOOL")" \
+  "$(jsonl_escape "$SAFE_PATH")" \
+  "$(jsonl_escape "$EXIT_CODE")" \
+  "$SUCCESS")"
+
+RAW_FILE="$STORE/raw/${SESSION}.jsonl"
+jsonl_append "$RAW_FILE" "$EVENT"
+
+exit 0

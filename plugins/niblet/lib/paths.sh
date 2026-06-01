@@ -15,16 +15,47 @@ niblet_store() {
   echo "$project_root/.niblet"
 }
 
-# Detect which AI runtime invoked the hook.
-# Priority: env vars → presence of config dirs → fallback to "claude".
+# Detect which AI runtime invoked the hook or tool.
+# Priority: explicit override → env vars → parent process name → presence of
+# runtime config dirs → fallback.
 niblet_runtime() {
+  # 0. Explicit override (wrappers and tests can force a runtime).
+  case "${NIBLET_RUNTIME:-}" in
+    claude|kimi) echo "$NIBLET_RUNTIME"; return ;;
+  esac
+
+  # 1. Explicit env vars (highest confidence)
   if [ -n "${CLAUDE_CODE_SESSION:-}${CLAUDE_PROJECT_DIR:-}" ]; then
     echo "claude"; return
   fi
-  if [ -n "${KIMI_SESSION:-}${KIMI_HOME:-}" ]; then
+  if [ -n "${KIMI_SESSION:-}${KIMI_HOME:-}${KIMI_WORK_DIR:-}" ]; then
     echo "kimi"; return
   fi
-  # No env hint — guess by parent process or fall back to claude
+
+  # 2. Parent process chain (useful when plugin tool is spawned by the runtime)
+  if command -v ps >/dev/null 2>&1 && command -v sed >/dev/null 2>&1; then
+    local parent_cmd
+    parent_cmd="$(ps -o comm= -p "$PPID" 2>/dev/null | sed 's/^[[:space:]]*//')"
+    case "$parent_cmd" in
+      kimi|kimi-cli|python3*)
+        # python3* because kimi-cli may run via python module
+        echo "kimi"; return
+        ;;
+      claude|claude-cli|claude-code)
+        echo "claude"; return
+        ;;
+    esac
+  fi
+
+  # 3. Config dir presence heuristic (when running from a shell inside the project)
+  if [ -d "$PWD/.kimi" ] && [ ! -d "$PWD/.claude" ]; then
+    echo "kimi"; return
+  fi
+  if [ -d "$PWD/.claude" ] && [ ! -d "$PWD/.kimi" ]; then
+    echo "claude"; return
+  fi
+
+  # 4. Fallback
   echo "claude"
 }
 
@@ -46,10 +77,13 @@ niblet_artifact_dir() {
   local kind="$1" scope="$2" project_root="$3"
   local rt; rt="$(niblet_runtime)"
   local rt_home; rt_home="$(niblet_runtime_home "$rt")"
-  local base_subdir
+  # Project-scope artifacts are stored under .claude/ for both runtimes so that
+  # KB, memory, skills, and CLAUDE.md/AGENTS.md live in one shared location.
+  local project_base=".claude"
+  local global_base
   case "$rt" in
-    kimi)  base_subdir=".kimi"   ;;
-    *)     base_subdir=".claude" ;;
+    kimi)  global_base=".kimi"   ;;
+    *)     global_base=".claude" ;;
   esac
 
   if [ "$scope" = "global" ]; then
@@ -64,13 +98,13 @@ niblet_artifact_dir() {
     esac
   else
     case "$kind" in
-      kb)        echo "$project_root/$base_subdir/kb" ;;
-      skills)    echo "$project_root/$base_subdir/skills/niblet" ;;
-      commands)  echo "$project_root/$base_subdir/commands/niblet" ;;
-      agents)    echo "$project_root/$base_subdir/agents/niblet" ;;
-      scripts)   echo "$project_root/$base_subdir/scripts/niblet" ;;
-      memory)    echo "$project_root/$base_subdir/memory" ;;
-      *)         echo "$project_root/$base_subdir/$kind" ;;
+      kb)        echo "$project_root/$project_base/kb" ;;
+      skills)    echo "$project_root/$project_base/skills/niblet" ;;
+      commands)  echo "$project_root/$project_base/commands/niblet" ;;
+      agents)    echo "$project_root/$project_base/agents/niblet" ;;
+      scripts)   echo "$project_root/$project_base/scripts/niblet" ;;
+      memory)    echo "$project_root/$project_base/memory" ;;
+      *)         echo "$project_root/$project_base/$kind" ;;
     esac
   fi
 }

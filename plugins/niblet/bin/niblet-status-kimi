@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# niblet-status-kimi — Kimi plugin wrapper for niblet-status.
+#
+# Extracts project_root from stdin JSON params, then invokes niblet-status.
+
+set -e
+
+# Force Kimi runtime so status reads from .kimi/ instead of .claude/.
+export NIBLET_RUNTIME=kimi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+
+INPUT="$(cat 2>/dev/null || true)"
+[ -n "$INPUT" ] || { echo "rejected: empty stdin" >&2; exit 64; }
+
+command -v jq >/dev/null 2>&1 || { echo "rejected: jq required" >&2; exit 70; }
+
+PROJECT_ROOT="$(printf '%s' "$INPUT" | jq -r '.project_root // empty')"
+[ -n "$PROJECT_ROOT" ] || PROJECT_ROOT="${KIMI_PROJECT_ROOT:-}"
+[ -n "$PROJECT_ROOT" ] || {
+  PROJECT_ROOT="$(cd "$PWD" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")"
+  printf 'warning: niblet_status did not receive project_root; falling back to detected cwd (%s). Pass an explicit project_root to see the correct project dashboard.\n' "$PROJECT_ROOT" >&2
+}
+
+"$SCRIPT_DIR/niblet-status" "$PROJECT_ROOT"

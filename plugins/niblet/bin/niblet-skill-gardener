@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# niblet-skill-gardener — auto-promote low-risk proposals and report on queues.
+#
+# Usage:
+#   niblet-skill-gardener [--project-root <abs-path>] [--dry-run]
+#
+# Environment:
+#   NIBLET_AUTO_PROMOTE=1   actually promote eligible proposals
+#   Without it (or with --dry-run) the script only reports what it would do.
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+. "$SCRIPT_DIR/../lib/paths.sh"
+. "$SCRIPT_DIR/../lib/gardener.sh"
+. "$SCRIPT_DIR/../lib/config.sh"
+
+PROJECT_ROOT=""
+DRY_RUN=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --project-root)
+      PROJECT_ROOT="$2"
+      shift 2
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    -h|--help)
+      printf 'Usage: %s [--project-root <abs-path>] [--dry-run]\n' "${0##*/}"
+      exit 0
+      ;;
+    -*)
+      printf 'unknown option: %s\n' "$1" >&2
+      exit 64
+      ;;
+    *)
+      PROJECT_ROOT="$1"
+      shift
+      ;;
+  esac
+done
+
+[ -n "$PROJECT_ROOT" ] || PROJECT_ROOT="$(niblet_project_root "$PWD")"
+[ -d "$PROJECT_ROOT" ] || { printf 'not a directory: %s\n' "$PROJECT_ROOT" >&2; exit 66; }
+
+niblet_load_config "$PROJECT_ROOT"
+
+STORE="$(niblet_store "$PROJECT_ROOT")"
+PROPOSALS_DIR="$STORE/proposals"
+PENDING_DEEP_DIR="$STORE/pending_deep"
+AUDIT_QUEUE_DIR="$STORE/audit_queue"
+DISTILL_QUEUE_DIR="$STORE/distill_queue"
+
+AUTO_PROMOTE="${NIBLET_AUTO_PROMOTE:-0}"
+[ "$DRY_RUN" = "1" ] && AUTO_PROMOTE=0
+
+promoted=0
+skipped=0
+would_promote=0
+
+printf 'niblet-skill-gardener: %s (auto-promote=%s, dry-run=%s)\n' \
+  "$PROJECT_ROOT" "$AUTO_PROMOTE" "$DRY_RUN"
+
+if [ -d "$PROPOSALS_DIR" ]; then
+  printf '\n-- proposals --\n'
+  for prop in "$PROPOSALS_DIR"/*.md; do
+    [ -f "$prop" ] || continue
+    base="$(basename "$prop")"
+    action="$(niblet_proposal_key "$prop" action)"
+    reason="$(niblet_proposal_skip_reason "$prop")"
+
+    if [ "$reason" = "eligible" ]; then
+      if [ "$AUTO_PROMOTE" = "1" ]; then
+        if ( cd "$PROJECT_ROOT" && "$SCRIPT_DIR/niblet-promote" "$prop" ); then
+          printf '  promoted %-22s %s\n' "$action" "$base"
+          promoted=$((promoted + 1))
+        else
+          printf '  failed   %-22s %s\n' "$action" "$base" >&2
+          skipped=$((skipped + 1))
+        fi
+      else
+        printf '  would-promote %-15s %s (set NIBLET_AUTO_PROMOTE=1)\n' "$action" "$base"
+        would_promote=$((would_promote + 1))
+      fi
+    else
+      printf '  skipped  %-22s %s (%s)\n' "$action" "$base" "$reason"
+      skipped=$((skipped + 1))
+    fi
+  done
+else
+  printf '\n-- proposals --\n  (no proposals directory)\n'
+fi
+
+# Queue reports. Draining deep/audit/distill queues requires agent reasoning,
+# so this script surfaces them and leaves the actual drain to the agent or hook.
+report_queue() {
+  local label="$1" dir="$2" pattern="$3"
+  printf '\n-- %s --\n' "$label"
+  if [ -d "$dir" ]; then
+    local count=0
+    for entry in "$dir"/$pattern; do
+      [ -f "$entry" ] || continue
+      printf '  %s\n' "$(basename "$entry")"
+      count=$((count + 1))
+    done
+    [ "$count" -gt 0 ] || printf '  (empty)\n'
+  else
+    printf '  (no queue directory)\n'
+  fi
+}
+
+report_queue "deep queue"    "$PENDING_DEEP_DIR"  "*.queue"
+report_queue "audit queue"   "$AUDIT_QUEUE_DIR"   "*.audit"
+report_queue "distill queue" "$DISTILL_QUEUE_DIR" "*.distill"
+
+printf '\n-- summary --\n'
+printf 'promoted:       %s\n' "$promoted"
+printf 'would-promote:  %s\n' "$would_promote"
+printf 'skipped:        %s\n' "$skipped"
