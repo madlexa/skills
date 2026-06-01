@@ -57,12 +57,28 @@ TURNS=0
 COUNTER_FILE="$STORE/sessions/$SESSION/task_counter"
 [ -f "$COUNTER_FILE" ] && TURNS="$(cat "$COUNTER_FILE" 2>/dev/null || echo 0)"
 
-{
-  echo "session_id=$SESSION"
-  echo "raw_log=$STORE/raw/${SESSION}.jsonl"
-  echo "turns=$TURNS"
-  echo "ended_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-} > "$QUEUE_FILE" 2>/dev/null
+# Gate: only enqueue a DEEP job when the session did real work. Trivial sessions
+# (no/few tool calls — e.g. a session that just answered a question or processed a
+# prior checkpoint) produce only NOTHING and otherwise make the queue self-
+# perpetuating, hijacking the next session's first prompt. Count post-phase tool
+# events in the raw log (same signal lib/digest.sh uses) and skip below the
+# threshold. NIBLET_DEEP_MIN_TOOLCALLS=0 restores the old unconditional behavior.
+RAW_LOG="$STORE/raw/${SESSION}.jsonl"
+TOOLCALLS=0
+[ -f "$RAW_LOG" ] && TOOLCALLS="$(grep -c '"phase":"post"' "$RAW_LOG" 2>/dev/null || echo 0)"
+case "$TOOLCALLS" in *[!0-9]*) TOOLCALLS=0 ;; esac
+DEEP_MIN_TC="${NIBLET_DEEP_MIN_TOOLCALLS:-8}"
+case "$DEEP_MIN_TC" in *[!0-9]*) DEEP_MIN_TC=8 ;; esac
+
+if [ "$TOOLCALLS" -ge "$DEEP_MIN_TC" ]; then
+  {
+    echo "session_id=$SESSION"
+    echo "raw_log=$RAW_LOG"
+    echo "turns=$TURNS"
+    echo "ended_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } > "$QUEUE_FILE" 2>/dev/null
+fi
+# Below threshold: no queue file written. Housekeeping below still runs.
 
 # Write sanitized digest (safe metadata only — no raw content).
 niblet_write_digest "$PROJECT_ROOT" "$SESSION" >/dev/null 2>&1 || true

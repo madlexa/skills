@@ -16,7 +16,7 @@ The parent's prompt names these paths explicitly:
 - **Raw session log** — JSONL of every tool call observed in the session
 - **Session digest** — sanitized summary at `.niblet/digests/<session_id>.json`
   (read this if available; it is faster than the raw log)
-- **Project KB directory** — already-saved findings (`.claude/kb/`)
+- **Project KB directory** — already-saved findings (`.claude/kb/` or `.kimi/kb/` depending on the active runtime)
 - **Project skills directory** — already-saved workflow patterns
 - **Project agents directory** — already-saved agent definitions
 - **Project commands directory** — already-saved slash commands

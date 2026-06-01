@@ -41,8 +41,29 @@ SESSION_DIR="$(niblet_session_dir "$PROJECT_ROOT" "$SESSION")"
 [ -n "$SESSION_DIR" ] || exit 0
 [ -n "$STORE" ] || exit 0
 
-# Per-turn FAST checkpoint (always).
-touch "$SESSION_DIR/PENDING_FAST" 2>/dev/null
+# Per-turn FAST checkpoint, gated on real file mutations.
+# Touching PENDING_FAST every turn means a FAST checkpoint is always pending and
+# fires mid-task on the next prompt. Only mark it when this turn actually changed
+# project files (Edit/Write/MultiEdit/NotebookEdit in the raw log). Track the count
+# seen so far in fast_seen and set the marker only when it grows. Without jq/raw
+# log we cannot tell, so fall back to the old always-touch behavior.
+# NIBLET_FAST_ON_EDIT_ONLY=0 restores unconditional per-turn marking.
+RAW_LOG="$STORE/raw/${SESSION}.jsonl"
+FAST_SEEN_FILE="$SESSION_DIR/fast_seen"
+if [ "${NIBLET_FAST_ON_EDIT_ONLY:-1}" = "1" ] && [ "$have_jq" = "1" ] && [ -f "$RAW_LOG" ]; then
+  EDITS="$(grep -cE '"phase":"post","tool":"(Edit|Write|MultiEdit|NotebookEdit)"' "$RAW_LOG" 2>/dev/null || echo 0)"
+  case "$EDITS" in *[!0-9]*) EDITS=0 ;; esac
+  PREV_EDITS=0
+  [ -f "$FAST_SEEN_FILE" ] && PREV_EDITS="$(cat "$FAST_SEEN_FILE" 2>/dev/null || echo 0)"
+  case "$PREV_EDITS" in *[!0-9]*) PREV_EDITS=0 ;; esac
+  if [ "$EDITS" -gt "$PREV_EDITS" ]; then
+    touch "$SESSION_DIR/PENDING_FAST" 2>/dev/null
+    printf '%s' "$EDITS" > "$FAST_SEEN_FILE" 2>/dev/null
+  fi
+else
+  # Fallback: behave as before (always mark).
+  touch "$SESSION_DIR/PENDING_FAST" 2>/dev/null
+fi
 
 # Per-session counter.
 COUNTER_FILE="$SESSION_DIR/task_counter"
@@ -55,7 +76,15 @@ printf '%s' "$COUNT" > "$COUNTER_FILE" 2>/dev/null
 # Normal DEEP comes from on_session_end.sh via the project queue.
 # The safety-net entry is also placed on the project queue so the
 # CURRENT session can pick it up on its NEXT UserPromptSubmit.
-if [ "$COUNT" -ge "$DEEP_THRESHOLD" ]; then
+# Gate the safety-net enqueue on real work too (same signal as on_session_end.sh),
+# so a long but tool-light session doesn't seed a NOTHING DEEP job.
+SN_TOOLCALLS=0
+[ -f "$RAW_LOG" ] && SN_TOOLCALLS="$(grep -c '"phase":"post"' "$RAW_LOG" 2>/dev/null || echo 0)"
+case "$SN_TOOLCALLS" in *[!0-9]*) SN_TOOLCALLS=0 ;; esac
+SN_MIN_TC="${NIBLET_DEEP_MIN_TOOLCALLS:-8}"
+case "$SN_MIN_TC" in *[!0-9]*) SN_MIN_TC=8 ;; esac
+
+if [ "$COUNT" -ge "$DEEP_THRESHOLD" ] && [ "$SN_TOOLCALLS" -ge "$SN_MIN_TC" ]; then
   QUEUE_DIR="$STORE/pending_deep"
   mkdir -p "$QUEUE_DIR" 2>/dev/null
   TS="$(date -u +%Y%m%dT%H%M%SZ)"

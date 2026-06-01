@@ -15,7 +15,7 @@ and report.
 The parent's prompt names these paths explicitly:
 
 - **Proposals directory** — `.niblet/proposals/` (read each `.md` file)
-- **KB directory** — `.claude/kb/` (check for conflicts with proposed content)
+- **KB directory** — `.claude/kb/` or `.kimi/kb/` (check for conflicts with proposed content)
 - **Artifact index** — `.niblet/index/artifacts.jsonl` (check for name conflicts)
 - **Project root** — for path containment checks
 
@@ -48,11 +48,11 @@ a single `REVIEW_RESULT` JSON object per proposal between the sentinels.
 **Path containment check:**
 - Does the `topic`, `name`, or `file` field resolve under the expected
   niblet-managed directory for its action type?
-  - KB entries: `.claude/kb/`
-  - Skills: `.claude/skills/niblet/`
-  - Agents: `.claude/agents/niblet/`
-  - Commands: `.claude/commands/niblet/`
-  - Scripts: `.claude/scripts/niblet/`
+  - KB entries: `.claude/kb/` or `.kimi/kb/`
+  - Skills: `.claude/skills/niblet/` or `.kimi/skills/niblet/`
+  - Agents: `.claude/agents/niblet/` or `.kimi/agents/niblet/`
+  - Commands: `.claude/commands/niblet/` or `.kimi/commands/niblet/`
+  - Scripts: `.claude/scripts/niblet/` or `.kimi/scripts/niblet/`
 - Flag: `path_escape` if the resolved path escapes the expected root
 
 **Conflict check:**

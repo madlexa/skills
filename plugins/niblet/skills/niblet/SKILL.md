@@ -1,307 +1,206 @@
 ---
 name: niblet
-description: Activated by hook-injected reminders (NIBLET CHECKPOINT). FAST checkpoint = write findings to KB/memory inline. DEEP checkpoint = spawn niblet-deep sub-agent, route risky outputs to .niblet/proposals/ for user review. Use when you see "NIBLET CHECKPOINT" in a system reminder.
+description: Project knowledge keeper. In Claude — reacts to NIBLET CHECKPOINT reminders. In Kimi Code CLI — uses MCP tools to log events, capture user corrections after interruptions (Ctrl+C, TaskStop, plan reject), and surface "wtf" feedback so it never repeats. All writes go through niblet-apply (secure entry point).
 user-invocable: false
 ---
 
 # niblet
 
-Niblet is the project's quiet crumb-keeper. The Stop hook fires after every
-turn; the next prompt carries a `NIBLET CHECKPOINT (fast)` reminder. At
-SessionEnd you'll see `NIBLET CHECKPOINT (deep)` instead. State is
-per-session — markers and counters live in
-`<project>/.niblet/sessions/<session-id>/`.
+Niblet quietly captures discoveries, workflow patterns, and user feedback across AI coding sessions.
 
-You do **not** invoke this skill. You act on the rules below when the
-reminder appears.
+- **Claude Code**: hooks inject `NIBLET CHECKPOINT` reminders automatically.
+- **Kimi Code CLI**: no hooks — use the four MCP tools (`niblet_log`, `niblet_apply`, `niblet_status`, `niblet_promote`) explicitly after file mutations, interruptions, and negative feedback.
 
 ## Trust model — two tiers of write authority
 
 | Tier | What gets written | Where |
 |---|---|---|
-| **Auto-write** (safe, local, reversible) | KB entries (project), feedback memory (project) | `<project>/.claude/kb/`, `<project>/.claude/memory/` |
-| **Proposal** (needs user promotion) | Skills, agents, scripts, commands, CLAUDE.md edits, any `scope=global` | `<project>/.niblet/proposals/` or `~/.niblet-proposals/` |
+| **Auto-write** (safe, local, reversible) | KB entries, feedback memory | `<project>/.claude/kb/` or `.kimi/kb/`; `.claude/memory/` or `.kimi/memory/` |
+| **Proposal** (needs user promotion) | Skills, agents, scripts, commands, AGENTS.md/CLAUDE.md edits, any `scope=global` | `<project>/.niblet/proposals/` or `~/.niblet-proposals/` |
 
-### Action types and their routing
+The runtime auto-detects whether the active CLI is Claude or Kimi and resolves artifact paths accordingly (`.claude/` vs `.kimi/`).
+
+### Action types and routing
 
 | Action | Scope | Routing |
 |---|---|---|
-| `ADD_KB_ENTRY` | project | **auto-write** → `<project>/.claude/kb/<topic>.md` |
-| `MERGE_KB_ENTRY` | project | **auto-write** → merged into `<project>/.claude/kb/<topic>.md` |
-| `UPDATE_KB_ENTRY` | project | **auto-write** → overwrites `<project>/.claude/kb/<topic>.md` |
-| `DEPRECATE_KB_ENTRY` | project | **auto-write** → prepends deprecation notice (tombstone if absent) |
-| `UPDATE_MEMORY` | project | **auto-write** → `<project>/.claude/memory/feedback_<slug>.md` |
+| `ADD_KB_ENTRY` | project | **auto-write** → `kb/<topic>.md` |
+| `MERGE_KB_ENTRY` | project | **auto-write** → merged into `kb/<topic>.md` |
+| `UPDATE_KB_ENTRY` | project | **auto-write** → overwrites `kb/<topic>.md` |
+| `DEPRECATE_KB_ENTRY` | project | **auto-write** → prepends deprecation notice |
+| `UPDATE_MEMORY` | project | **auto-write** → `memory/feedback_<slug>.md` |
 | `CREATE_SKILL` | any | **proposal** |
 | `CREATE_AGENT` | any | **proposal** |
-| `CREATE_SCRIPT` | any | **proposal** (envelope includes bash/python validation result) |
+| `CREATE_SCRIPT` | any | **proposal** (envelope includes validation result) |
 | `CREATE_COMMAND` | any | **proposal** |
-| `UPDATE_SKILL` | any | **proposal** (backup written before overwrite on promotion) |
-| `UPDATE_AGENT` | any | **proposal** (backup written before overwrite on promotion) |
-| `UPDATE_COMMAND` | any | **proposal** (backup written before overwrite on promotion) |
-| `UPDATE_SCRIPT` | any | **proposal** (backup written before overwrite on promotion) |
+| `UPDATE_SKILL` | any | **proposal** (backup before overwrite on promotion) |
+| `UPDATE_AGENT` | any | **proposal** (backup before overwrite) |
+| `UPDATE_COMMAND` | any | **proposal** (backup before overwrite) |
+| `UPDATE_SCRIPT` | any | **proposal** (backup before overwrite) |
 | `UPDATE_CLAUDE` | project | **proposal** |
-| `OPEN_QUESTION` | any | **proposal** (question text for human review) |
-| `AUDIT_REPORT` | any | **proposal** (structured audit findings for human review) |
+| `UPDATE_AGENTS` | project | **proposal** |
+| `UPDATE_CLAUDE` / `UPDATE_AGENTS` | global | **proposal** |
+| `OPEN_QUESTION` | any | **proposal** |
+| `AUDIT_REPORT` | any | **proposal** |
 | `ADD_KB_ENTRY` | global | **proposal** → `~/.niblet-proposals/` |
 | `UPDATE_MEMORY` | global | **proposal** |
-| unknown action | any | **proposal** with `rejected_reason=unknown-action` |
+| unknown action | any | **proposal** with `rejected_reason` |
 | bad slug or path escape | any | **proposal** with `rejected_reason` |
 
-Why proposals: skills and CLAUDE.md affect every future session and are
-checked into git. Auto-writing them would let any text Claude reads
-(e.g. an attacker's README) become a permanent committed instruction.
-Proposals require a human action to take effect.
+Why proposals: skills and AGENTS.md affect every future session and are checked into git. Auto-writing them would let any text the AI reads become a permanent committed instruction. Proposals require a human action to take effect.
 
-### Single write entry point — `bin/niblet-apply`
-
-You do NOT call Edit/Write directly to KB/memory/skills/commands/CLAUDE.md
-when acting on a NIBLET CHECKPOINT. Every action goes through the plugin's
-secure helper, which validates slugs, enforces path containment, and
-routes to auto-write vs proposal.
-
-**Always Write-then-stdin. Never echo-pipe.** The `content` / `addition`
-fields can legitimately contain single quotes, backslashes, and other
-shell metachars (it's free-form markdown). An `echo '<json>' | …`
-invocation would let those bytes break out of the quoting before
-niblet-apply ever validates anything. The Write tool does not
-shell-interpret content, so the staged file is byte-exact:
-
-```bash
-# Step 1 (Write tool, NOT bash): create the JSON file
-Write file_path=<project>/.niblet/inbox/<random>.json
-Content:
-  {"action":"ADD_KB_ENTRY","scope":"project","topic":"auth.md","content":"…"}
-
-# Step 2 (Bash tool): feed via stdin redirection. `niblet-apply` resolves
-# on PATH — Claude Code adds the plugin's bin/ to the hook/Bash PATH, so
-# the bare command works without `${CLAUDE_PLUGIN_ROOT}` expansion.
-niblet-apply --project-root "$PROJECT_ROOT" \
-  < <project>/.niblet/inbox/<random>.json
-```
-
-The reminder text spells out the exact command per action. Direct Edit/Write
-to the target tree bypasses validation and is a security regression —
-don't do it. `echo '<json>' | niblet-apply` is also a security regression
-— don't do it either.
-
-## When you see "NIBLET CHECKPOINT (fast)"
-
-A turn just ended. Before responding to the user:
-
-1. **Review** the turn. Look for durable, non-obvious knowledge:
-   - "Where does X live?"
-   - "Why does Y work this way?"
-   - "User prefers A over B because…"
-
-2. **Stage an ACTION JSON via Write, then pipe it into `niblet-apply`** —
-   never Edit/Write the target file directly, never `echo '<json>' | …`:
-   - Project facts → `ADD_KB_ENTRY` action with `topic` (slug, ending `.md`)
-   - User preferences → `UPDATE_MEMORY` action with `file=feedback_<slug>.md`
-
-3. **Do not** create skills, commands, or modify CLAUDE.md here.
-   Those happen in the DEEP checkpoint as proposals.
-
-4. **Update over create.** Reuse an existing slug to land in the same file.
-   The helper happily writes over an existing file; no duplicates needed.
-
-5. **Skip** trivial turns. Don't fire ACTIONs to clear the marker.
-
-6. **Delete the marker** the reminder names:
-   `rm <project>/.niblet/sessions/<session-id>/PENDING_FAST`
-
-7. Now respond to the user's request.
-
-## When you see "NIBLET CHECKPOINT (deep)"
-
-A previous session has ended. Its raw log is queued for analysis.
-
-1. **Spawn** a `general-purpose` sub-agent via Task tool. Use the prompt
-   verbatim from the reminder — it names the **queued raw log** (not the
-   current session's), the slug constraints, and the strict JSONL format.
-
-2. **Wait** for output between sentinels:
-   ```
-   <<<NIBLET ACTIONS BEGIN>>>
-   {"action":"...", ...}
-   <<<NIBLET ACTIONS END>>>
-   ```
-
-3. **Stage each ACTION JSON via Write, then pipe via stdin** through
-   `niblet-apply` — the helper enforces slug rules, containment, and the
-   auto vs proposal routing. You don't route yourself; the helper does.
-   Use one inbox file per ACTION (`$STORE/inbox/<random>.json`). Watch
-   stdout:
-   ```
-   applied: ADD_KB_ENTRY -> /…/.claude/kb/auth.md
-   proposal: CREATE_SKILL -> /…/.niblet/proposals/<ts>-<slug>.md
-   ```
-   Anything rejected (bad slug, path escape) lands as a proposal with a
-   `rejected_reason` so the user can see what the sub-agent tried.
-
-4. **Delete the queue entry** the reminder names:
-   `rm <project>/.niblet/pending_deep/<ts>-<session>.queue`
-
-5. **Tell the user briefly** what was applied vs proposed, including
-   `<project>/.niblet/proposals/` so they can review with
-   `niblet-promote` — never raw `mv`. Then respond to their request.
-
-## When you see "NIBLET CHECKPOINT (distill)"
-
-The project KB has grown above the distill threshold (default: 20 files or
-200 000 bytes). Before responding to the user:
-
-1. **Spawn** a `general-purpose` sub-agent via Task tool. Use the prompt
-   verbatim from the reminder — it names the **KB directory**, memory
-   directory, digests directory, and project root.
-
-2. **Wait** for output between sentinels — same format as DEEP:
-   ```
-   <<<NIBLET ACTIONS BEGIN>>>
-   {"action":"...", ...}
-   <<<NIBLET ACTIONS END>>>
-   ```
-
-3. **Stage each ACTION JSON via Write, then pipe via stdin** through
-   `niblet-apply`:
-   - `MERGE_KB_ENTRY`, `UPDATE_KB_ENTRY`, `DEPRECATE_KB_ENTRY` (project scope)
-     → **auto-write** (no proposal needed)
-   - `CREATE_SKILL`, `CREATE_AGENT`, `CREATE_COMMAND`, any `scope=global`
-     → **proposal** (requires user promotion)
-
-4. **Delete the claimed distill entry** the reminder names.
-
-5. **Tell the user briefly** what was merged, deprecated, or proposed.
-   Then respond to their request.
-
-## When you see "NIBLET CHECKPOINT (audit)"
-
-A periodic audit is due. The niblet plugin triggers this after every N sessions
-(default: 5) by writing an entry to `.niblet/audit_queue/`. Before responding
-to the user:
-
-1. **Spawn** a `general-purpose` sub-agent via Task tool. Use the prompt
-   verbatim from the reminder — it names the **artifact index**, KB directory,
-   memory directory, digests directory, and project root.
-
-2. **Wait** for output between sentinels — same format as DEEP:
-   ```
-   <<<NIBLET ACTIONS BEGIN>>>
-   {"action":"...", ...}
-   <<<NIBLET ACTIONS END>>>
-   ```
-
-3. **Stage each ACTION JSON via Write, then pipe via stdin** through
-   `niblet-apply`:
-   - `UPDATE_KB_ENTRY`, `DEPRECATE_KB_ENTRY` (project scope) → **auto-write**
-   - `UPDATE_SKILL`, `UPDATE_AGENT`, `UPDATE_COMMAND` → **proposal**
-   - `AUDIT_REPORT`, `OPEN_QUESTION` → **proposal** (for human review)
-
-4. **Delete the claimed audit entry** the reminder names.
-
-5. **Tell the user briefly** what was updated, deprecated, or proposed.
-   Then respond to their request.
-
-## Reviewing proposals — `niblet-proposal-reviewer`
-
-Before promoting a proposal, you can invoke the proposal-reviewer agent for
-a safety audit. The parent agent (you) spawns it with a prompt listing the
-proposals directory and the project root. The sub-agent returns a structured
-`approve` / `flag` decision per proposal — it never modifies anything.
-
-```bash
-# Optional: review all pending proposals before batch-promoting
-# Use niblet-status to see the count first, then spawn niblet-proposal-reviewer
-# via the Agent/Task tool with the proposals directory path.
-```
-
-The reviewer checks: no secrets in content, one artifact per proposal,
-evidence present for UPDATE_*/DEPRECATE_* actions, path containment, no
-name conflicts, beginner_summary readable. An `approve` result means safe
-to promote; a `flag` result lists the specific checks that failed.
-
-## Configuration reference
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `NIBLET_DEEP_THRESHOLD` | `20` | Safety-net: enqueue DEEP mid-session after this many turns |
-| `NIBLET_KB_DISTILL_COUNT` | `20` | KB file count above which DISTILL is queued (once per session) |
-| `NIBLET_KB_DISTILL_BYTES` | `200000` | KB byte total above which DISTILL is queued |
-| `NIBLET_AUDIT_INTERVAL_SESSIONS` | `5` | Sessions between AUDIT triggers |
-| `NIBLET_GUARDED_APPLY` | unset | When `1`, auto-promotes `risk=low + confidence=high` MERGE/UPDATE_KB_ENTRY without user action |
-| `NIBLET_BEGINNER_UX` | unset | When `1`, embeds `beginner_summary` in proposals; niblet-status uses plain language |
-
-## niblet-status
-
-```bash
-niblet-status <project_root>
-```
-
-Prints a project dashboard without emitting any file content — only counts,
-filenames, and paths:
-
-- KB entry count
-- Memory file count
-- Pending proposals count (with action-type breakdown)
-- Promoted artifacts (by category)
-- distill_queue and audit_queue depth
-- Plain-language "next steps" (non-technical when `NIBLET_BEGINNER_UX=1`)
-
-## Proposal promotion — `niblet-promote`
-
-When the user has reviewed a proposal and wants to apply it, the canonical
-command is:
-
-```bash
-niblet-promote <proposal-file>
-```
-
-The helper is action-aware:
-- `CREATE_SKILL` / `CREATE_AGENT` / `CREATE_COMMAND` / `CREATE_SCRIPT` →
-  strips the envelope, writes the payload to the target path.
-  `CREATE_SCRIPT` re-validates before writing and never sets executable bit.
-- `ADD_KB_ENTRY` / `UPDATE_MEMORY` / `MERGE_KB_ENTRY` / `UPDATE_KB_ENTRY` →
-  strips the envelope, writes/merges payload to target.
-- `UPDATE_SKILL` / `UPDATE_AGENT` / `UPDATE_COMMAND` / `UPDATE_SCRIPT` →
-  creates a backup at `<target>.niblet-backup` before overwriting.
-- `DEPRECATE_KB_ENTRY` → renames target to `<target>.deprecated`.
-- `UPDATE_CLAUDE` → locates the named `## section` heading in the target
-  CLAUDE.md and **appends** the addition under it. Creates the section
-  if absent. Never overwrites the file.
-- `OPEN_QUESTION` / `AUDIT_REPORT` → no-op (already in proposals dir;
-  mark as reviewed by removing the file).
-
-Plain `mv` would double-wrap SKILL frontmatter and replace CLAUDE.md
-wholesale — do not document `mv` as a promotion path.
-
-## Proposal file format
-
-```markdown
----
-action: CREATE_SKILL
-scope: project
-target: <project>/.claude/skills/niblet/<name>/SKILL.md
-created: <UTC timestamp>
 ---
 
-<exact content payload from the sub-agent — for CREATE_SKILL this is a
- full SKILL.md including its own frontmatter>
+## Kimi-specific rules (explicit MCP tool calls)
+
+In Kimi Code CLI there are no automatic hooks. **You must call the niblet MCP tools yourself** following the rules below.
+
+Available tools:
+- `niblet_log` — append a sanitized event to the raw session log.
+- `niblet_apply` — secure write entry point for all KB/memory/proposal actions.
+- `niblet_status` — project dashboard (counts and paths only).
+- `niblet_promote` — apply a reviewed proposal file.
+
+### 1. ALWAYS log file mutations
+After **every** `WriteFile`, `StrReplaceFile`, or `NotebookEdit` call, immediately invoke `niblet_log` with these arguments:
+
+```json
+{
+  "session_id": "<current session id>",
+  "tool": "WriteFile",
+  "path": "src/main.py",
+  "exit_code": "",
+  "success": true
+}
 ```
 
-Filename pattern: `<UTCdate>-<ACTION>-<short-slug>.md`
-(e.g. `20260527T103412Z-CREATE_SKILL-rebase-no-amend.md`).
+For `Bash` tools, also log but omit the command args (path stays empty):
+```json
+{
+  "session_id": "<current session id>",
+  "tool": "Bash",
+  "path": "",
+  "exit_code": "0",
+  "success": true
+}
+```
 
-## What NOT to save
+This builds the raw session log so `niblet-deep` can extract patterns later.
 
-- Code patterns derivable by reading the source. Anything `grep` would find.
+### 2. IMMEDIATELY capture interruptions, corrections, and negative sentiment
+Follow the **Universal rules → Capture interruptions and negative feedback immediately** section above. Call `niblet_apply` with `UPDATE_MEMORY` for `feedback_interruptions.md` or `feedback_wtf.md` before continuing with the user's request.
+
+### 3. Session-end deep analysis
+When the user says "save findings", "сохрани выводы", or the session is clearly wrapping up:
+
+1. Call `niblet_status` to see the dashboard.
+2. If the raw log has ≥ 8 tool calls, spawn a sub-agent with the `niblet-deep` skill/prompt and pass the raw log path.
+3. Route the sub-agent's JSONL actions through `niblet_apply` one by one.
+4. Delete the raw log or mark the session as processed (your choice — the store is in `<project>/.niblet/raw/`).
+
+### 4. KB index on session start
+At the **very beginning** of a Kimi session (before answering the user), read the KB directory and emit a compact index:
+
+```bash
+# Niblet writes to .kimi/ under Kimi Code CLI
+ls -1 <project>/.kimi/kb/*.md 2>/dev/null
+ls -1 <project>/.kimi/memory/*.md 2>/dev/null
+```
+
+List **only filenames** (no H1, no content) — same safety rule as the Claude SessionStart hook. This helps you know which topics are already covered.
+
+---
+
+## Claude-specific rules (hook-driven checkpoints)
+
+When you see a `NIBLET CHECKPOINT` reminder injected by the hooks, follow the original rules from the plugin:
+
+- **URGENT FAST checkpoint** — if the reminder is marked **URGENT**, the user's message is a correction, interruption signal, or negative feedback. Capture it as `UPDATE_MEMORY` (`feedback_interruptions.md` or `feedback_wtf.md`) via `niblet-apply` **before** answering them. Then continue with their request.
+- **FAST checkpoint** — turn-local findings. Write `ADD_KB_ENTRY` or `UPDATE_MEMORY` via `niblet-apply`. Never create skills/commands here. Delete the `PENDING_FAST` marker when done.
+- **DEEP checkpoint** — previous session analysis. Spawn `niblet-deep` sub-agent, route actions through `niblet-apply`, delete the queue entry.
+- **DISTILL checkpoint** — KB consolidation. Spawn `niblet-distill` sub-agent.
+- **AUDIT checkpoint** — periodic health check. Spawn `niblet-audit` sub-agent.
+
+All checkpoints are **background bookkeeping** — non-blocking, silent. Handle the user's request first, unless the FAST reminder is URGENT; in that case capture the feedback first.
+
+---
+
+## Universal rules (both runtimes)
+
+### Capture interruptions and negative feedback immediately
+
+If the user **stops execution** (Ctrl+C, TaskStop), **rejects a plan** (ExitPlanMode reject/revise), or **sends a correction** after an interruption, capture it as memory feedback **before doing anything else**:
+
+```json
+{
+  "project_root": "/abs/path/to/project",
+  "action": {
+    "action": "UPDATE_MEMORY",
+    "scope": "project",
+    "file": "feedback_interruptions.md",
+    "content": "---\nname: feedback-interruptions\ndescription: User corrections after interrupted execution\nmetadata: { type: interruption, source: <session_id> }\n---\n\n- <timestamp>: User stopped execution because… <exact correction>\n- <timestamp>: Should have done: <what user wants instead>\n"
+  }
+}
+```
+
+**Do not paraphrase.** Use the user's exact words for the correction. This is critical input for future sessions.
+
+Also capture "wtf" and negative sentiment immediately. If the user's message contains **any** of these signals (case-insensitive):
+
+- `wtf`
+- `не так`
+- `переделай`
+- `стоп`
+- `заново`
+- `это бред`
+- `ничего не работает`
+- `никогда так не делай`
+- `never do that`
+
+Capture it as negative feedback by calling `niblet_apply` with these arguments:
+
+```json
+{
+  "project_root": "/abs/path/to/project",
+  "action": {
+    "action": "UPDATE_MEMORY",
+    "scope": "project",
+    "file": "feedback_wtf.md",
+    "content": "---\nname: feedback-wtf\ndescription: Negative sentiment triggers to avoid\nmetadata: { type: negative_feedback, source: <session_id> }\n---\n\n- <timestamp>: Message: \"<exact user message>\"\n- <timestamp>: Context: <what you did that triggered it>\n- <timestamp>: Fix: <what should be done differently next time>\n"
+  }
+}
+```
+
+Then **continue** with the user's actual request. Do not apologize at length — just fix it and move on.
+
+For **Claude Code**: when the `NIBLET CHECKPOINT (fast)` reminder includes an **URGENT** note, treat the user's message as a correction/negative feedback and apply `UPDATE_MEMORY` before continuing with their request.
+
+For **Kimi Code CLI**: there are no automatic hooks, so you must call the niblet tools yourself following the rules above.
+
+### Single write entry point — `niblet_apply` / `niblet-apply`
+
+Never call `Edit`/`Write` directly to KB, memory, skills, commands, scripts, or `AGENTS.md`/`CLAUDE.md`. Always route through the secure helper.
+
+**For Kimi Code CLI**: call the `niblet_apply` MCP tool with arguments containing `project_root` and `action`.
+
+**For Claude**: stage the JSON to a file with `Write`, then pipe via Bash:
+```bash
+niblet-apply --project-root "$PROJECT_ROOT" < <project>/.niblet/inbox/<random>.json
+```
+
+Never `echo '<json>' | niblet-apply` — shell metachars in content can break out before validation.
+
+### What NOT to save
+
+- Code patterns derivable by reading the source.
 - Step-by-step tool calls. KB records *findings*, not your action log.
-- Apologies, hedges, "I'll do better." Worthless to future you.
+- Apologies, hedges, "I'll do better."
 - Project state in flux (current branch, in-progress work, today's TODOs).
-- Anything you saw in a file's contents that might be a secret, even if
-  the user pasted it. Memory persists; secrets shouldn't.
+- Anything that might be a secret.
 
-## Output format hints
+### Output format hints
 
-**KB entry** (`<project>/.claude/kb/<topic>.md`):
+**KB entry** (`kb/<topic>.md`):
 ```markdown
 # <Topic>
 
@@ -318,7 +217,7 @@ Filename pattern: `<UTCdate>-<ACTION>-<short-slug>.md`
 - Pitfall 1 — and how to avoid it.
 ```
 
-**Memory feedback** (`<project>/.claude/memory/feedback_<slug>.md`):
+**Memory feedback** (`memory/feedback_<slug>.md`):
 ```markdown
 ---
 name: feedback-<slug>
@@ -332,13 +231,13 @@ metadata: { type: feedback }
 **How to apply:** <when this kicks in>
 ```
 
-**Skill proposal** (`<project>/.niblet/proposals/<ts>-<slug>.md`):
+**Skill proposal** (`.niblet/proposals/<ts>-<slug>.md`):
 ```markdown
 ---
 action: CREATE_SKILL
 scope: project
-target: <project>/.claude/skills/niblet/<name>/SKILL.md
-created: 2026-05-27T10:34:12Z
+target: <project>/skills/niblet/<name>/SKILL.md
+created: <UTC timestamp>
 ---
 
 ---
@@ -354,3 +253,14 @@ description: <when to use this skill>
 ## Steps
 1. …
 ```
+
+## Configuration reference
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `NIBLET_DEEP_THRESHOLD` | `20` | Safety-net: enqueue DEEP mid-session after this many turns (Claude only) |
+| `NIBLET_KB_DISTILL_COUNT` | `20` | KB file count above which DISTILL is queued |
+| `NIBLET_KB_DISTILL_BYTES` | `200000` | KB byte total above which DISTILL is queued |
+| `NIBLET_AUDIT_INTERVAL_SESSIONS` | `5` | Sessions between AUDIT triggers |
+| `NIBLET_GUARDED_APPLY` | unset | When `1`, auto-promotes `risk=low + confidence=high` MERGE/UPDATE_KB_ENTRY |
+| `NIBLET_BEGINNER_UX` | unset | When `1`, embeds `beginner_summary` in proposals; plain-language status |

@@ -1,6 +1,6 @@
 # niblet
 
-The diligent crumb-keeper for AI coding sessions in Claude Code (and Kimi Code).
+The diligent crumb-keeper for AI coding sessions in Claude Code and Kimi Code CLI.
 
 Every session produces discoveries, workflow patterns, and project-specific
 knowledge. Niblet quietly captures them — no manual `/save` or `/evolve`
@@ -10,6 +10,8 @@ them as **proposals** you review before promoting. The next session starts
 with a compact KB index already surfaced.
 
 ## Install
+
+### Claude Code
 
 ```
 /plugin marketplace add madlexa/skills
@@ -21,6 +23,85 @@ Or for local development:
 ```bash
 claude --plugin-dir /path/to/madlexa/skills/plugins/niblet
 ```
+
+### Kimi Code CLI
+
+Niblet for Kimi Code CLI is two pieces that work together:
+
+1. **MCP tools** (`kimi.plugin.json`) — four callable tools provided by the
+   bundled MCP server: `niblet_log`, `niblet_apply`, `niblet_status`,
+   `niblet_promote`.
+2. **Skill** (`skills/niblet/SKILL.md`) — system instructions telling the agent
+   when to call those tools. The skill is auto-loaded at session start.
+
+#### Install
+
+From the repo root (the directory containing `plugins/niblet/`):
+
+```bash
+git clone https://github.com/madlexa/skills.git ~/madlexa-skills
+cd ~/madlexa-skills
+```
+
+Inside Kimi Code CLI:
+
+```
+/plugins install /absolute/path/to/madlexa-skills/plugins/niblet
+/new
+```
+
+Use an absolute path. `kimi-code` copies the plugin to a managed directory;
+after installing you need `/new` (or `/reload`) for the skill and MCP server to
+activate.
+
+#### Update
+
+```bash
+cd /path/to/madlexa-skills
+git pull
+```
+
+Then reinstall inside Kimi Code CLI (edits to the source directory do not
+affect the managed copy):
+
+```
+/plugins remove niblet
+/plugins install /absolute/path/to/madlexa-skills/plugins/niblet
+/new
+```
+
+#### Uninstall
+
+```
+/plugins remove niblet
+/new
+```
+
+#### Verify
+
+Start a new Kimi session in any git project and ask:
+
+```
+run niblet_status for this project
+```
+
+The agent should call the `niblet_status` MCP tool and print a dashboard with KB
+counts, memory files, and pending proposals.
+
+#### What the agent does in Kimi
+
+Kimi Code CLI has no automatic hooks, so the skill tells the agent to call the
+MCP tools explicitly:
+
+- After every file-mutating tool (`WriteFile`, `StrReplaceFile`, etc.) →
+  `niblet_log` to build the raw session log.
+- After interruptions (Ctrl+C, TaskStop), plan rejects, or negative feedback →
+  `niblet_apply` with `UPDATE_MEMORY` to `feedback_interruptions.md` or
+  `feedback_wtf.md`.
+- At session end or when the user says "save findings" → `niblet_status`, then
+  spawn deep analysis if the log is large enough.
+- When reviewing proposals → `niblet_promote` with the proposal file path to
+  apply it.
 
 ## Platform support & requirements
 
@@ -71,9 +152,18 @@ Existing tools observe but don't act:
   knowledge belongs.
 
 Niblet adds the missing layer: **judgement**. It decides whether new
-knowledge belongs as a KB entry (auto), a workflow skill (proposal), a
-CLAUDE.md addition (proposal), or a memory file (auto) — and routes it
+knowledge belongs as a KB entry (auto), a workflow skill (proposal), an
+AGENTS.md/CLAUDE.md addition (proposal), or a memory file (auto) — and routes it
 accordingly.
+
+**New in v0.4.0 — Interruption & "wtf" capture.**
+When a user stops execution (Ctrl+C, TaskStop), rejects a plan, or sends a
+correction, niblet immediately writes the feedback to durable memory so the
+next session knows what *not* to do. "wtf" and other negative-sentiment
+triggers are captured the same way — no recurrence. In Claude Code, the
+FAST checkpoint is elevated above DEEP/AUDIT/DISTILL whenever the user
+prompt contains one of these signals, so the correction is recorded before
+any background work.
 
 ## How it works
 
@@ -118,7 +208,7 @@ Session
   │     Agent spawns niblet-deep via Task tool; reads digest if available
   │     Sub-agent emits JSONL ACTIONs between sentinels
   │     Agent pipes each ACTION through bin/niblet-apply
-  │     Risky ACTIONs (skills, agents, scripts, CLAUDE.md, any global)
+  │     Risky ACTIONs (skills, agents, scripts, CLAUDE.md, AGENTS.md, any global)
   │       → proposals; user promotes via bin/niblet-promote (never raw mv)
   │
   ├── DISTILL checkpoint (sub-agent consolidates KB)
@@ -166,6 +256,7 @@ Two tiers — `niblet-apply` enforces them; the agent does not choose:
 | `UPDATE_COMMAND` | any | **proposal** (backup created before overwrite on promotion) |
 | `UPDATE_SCRIPT` | any | **proposal** (backup created before overwrite on promotion) |
 | `UPDATE_CLAUDE` | project | **proposal** |
+| `UPDATE_AGENTS` | project | **proposal** |
 | `OPEN_QUESTION` | any | **proposal** (question text only; for human review) |
 | `AUDIT_REPORT` | any | **proposal** (structured audit findings; for human review) |
 | `ADD_KB_ENTRY` | global | **proposal** → `~/.niblet-proposals/` |
@@ -311,7 +402,8 @@ Project-local `.niblet/`, `.claude/kb/`, and any pending proposals are
 
 ```
 niblet/
-├── .claude-plugin/plugin.json         # plugin manifest
+├── .claude-plugin/plugin.json         # Claude Code plugin manifest
+├── kimi.plugin.json                   # Kimi Code CLI plugin manifest + MCP server
 ├── skills/niblet/SKILL.md             # how agent reacts to checkpoints
 ├── agents/
 │   ├── niblet-deep.md                 # sub-agent prompt for DEEP layer
@@ -335,13 +427,26 @@ niblet/
 │   ├── sanitize.sh                    # safe path + slug + containment helpers
 │   ├── store.sh                       # ensure store + write .niblet/.gitignore
 │   └── digest.sh                      # sanitized session digest writer
-└── tests/smoke_test.sh                # contract test suite (~149 assertions)
+└── tests/smoke_test.sh                # contract test suite (~177 assertions)
 ```
 
 ## Status
 
-**v0.3.0** — autonomous learning layer. Builds on v0.2.0's security
-foundations with five new subsystems:
+**v0.4.0** — interruption & negative-feedback capture, plus AGENTS.md support.
+
+- **Forced Kimi runtime for Kimi wrapper.** `niblet-apply-kimi` now sets
+  `NIBLET_RUNTIME=kimi`, so writes always land under `.kimi/` even when no
+  Kimi env var is present.
+- **Accumulating memory feedback.** `UPDATE_MEMORY` appends new feedback to
+  existing `feedback_interruptions.md` / `feedback_wtf.md` instead of
+  overwriting the previous correction.
+- **Urgent FAST checkpoint for Claude.** User prompts containing negative
+  feedback or interruption signals now raise the FAST checkpoint above
+  DEEP/AUDIT/DISTILL, so corrections are captured immediately.
+- **`UPDATE_AGENTS` action.** `AGENTS.md` additions are staged as proposals
+  and promoted with the same section-append logic as `UPDATE_CLAUDE`.
+
+Previous v0.3.x highlights:
 
 - **Session digest layer.** At SessionEnd, niblet writes a sanitized
   digest per session (`.niblet/digests/`) with file counts, turn count,
@@ -372,6 +477,6 @@ foundations with five new subsystems:
   `niblet-promote --guarded-sweep` auto-applies `risk=low + confidence=high`
   MERGE/UPDATE_KB_ENTRY proposals. All other action types remain manual.
 
-~149 contract assertions pass, including security regression checks
+~177 contract assertions pass, including security regression checks
 against path traversal, secret leakage, frontmatter double-wrapping,
-CLAUDE.md overwrite, and guarded-apply scope enforcement.
+CLAUDE.md/AGENTS.md overwrite, and guarded-apply scope enforcement.

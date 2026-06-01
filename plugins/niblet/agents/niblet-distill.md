@@ -14,8 +14,8 @@ emit a JSONL block of consolidation actions.
 
 The parent's prompt names these paths explicitly:
 
-- **KB directory** — all current KB entries (`.claude/kb/`)
-- **Memory directory** — all feedback/correction records (`.claude/memory/`)
+- **KB directory** — all current KB entries (`.claude/kb/` or `.kimi/kb/` depending on runtime)
+- **Memory directory** — all feedback/correction records (`.claude/memory/` or `.kimi/memory/` depending on runtime)
 - **Digests directory** — sanitized session summaries (`.niblet/digests/`)
 - **Skills directory** — existing skill definitions
 - **Agents directory** — existing agent definitions

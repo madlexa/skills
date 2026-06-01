@@ -109,7 +109,7 @@ write_proposal() {
   # (NAME / TOPIC / FILE). For UPDATE_CLAUDE, derive from SECTION. Falls
   # back to "unnamed" so the filename is never bare "<ts>-<ACTION>-.md".
   local slug_src="$NAME$TOPIC$FILE"
-  if [ -z "$slug_src" ] && [ "$ACTION" = "UPDATE_CLAUDE" ]; then
+  if [ -z "$slug_src" ] && { [ "$ACTION" = "UPDATE_CLAUDE" ] || [ "$ACTION" = "UPDATE_AGENTS" ]; }; then
     slug_src="$SECTION"
   fi
   local slug
@@ -168,7 +168,7 @@ write_proposal() {
         || true)"
       printf '\n<!-- NIBLET BEGINNER SUMMARY -->\n%s\n<!-- END NIBLET BEGINNER SUMMARY -->\n\n' "$_safe_bsum"
     fi
-    if [ "$ACTION" = "UPDATE_CLAUDE" ]; then
+    if [ "$ACTION" = "UPDATE_CLAUDE" ] || [ "$ACTION" = "UPDATE_AGENTS" ]; then
       printf '%s\n' "$ADDITION"
     else
       printf '%s\n' "$CONTENT"
@@ -219,6 +219,35 @@ write_auto() {
   echo "applied: $ACTION -> $target_path"
 }
 
+# Append the body of a memory feedback entry to an existing file, preserving
+# the original frontmatter. If the file does not exist yet, write the full
+# content (frontmatter + body). This ensures repeated corrections accumulate
+# instead of overwriting the previous one.
+append_memory_file() {
+  local target_path="$1" allowed_root="$2"
+  if ! niblet_assert_no_symlink_in_path "$target_path" "$allowed_root" 2>/dev/null; then
+    proposal "symlink-in-path:target=$target_path"
+    return
+  fi
+  mkdir -p "$(dirname "$target_path")" 2>/dev/null
+  if [ -f "$target_path" ]; then
+    # Strip the frontmatter from the incoming content (if present) and append
+    # only the body. Content without frontmatter is appended as-is.
+    local new_body
+    new_body="$(printf '%s\n' "$CONTENT" | awk '/^---$/ { c++; next } c >= 2 { print }')"
+    # If there was no frontmatter (no second ---), append the whole content.
+    if [ -z "$new_body" ] && ! printf '%s\n' "$CONTENT" | awk 'BEGIN{found=0} /^---$/ { found++; if (found>=2) exit } END{exit found>=2 ? 0 : 1}' >/dev/null 2>&1; then
+      new_body="$CONTENT"
+    fi
+    if [ -n "$new_body" ]; then
+      printf '\n%s\n' "$new_body" >> "$target_path"
+    fi
+  else
+    printf '%s\n' "$CONTENT" > "$target_path"
+  fi
+  echo "applied: $ACTION -> $target_path"
+}
+
 # ---- dispatch ----
 case "$ACTION" in
   NOTHING)
@@ -243,7 +272,7 @@ case "$ACTION" in
     target="$MEM/$FILE"
     case "$target" in *.md) ;; *) target="$target.md" ;; esac
     niblet_assert_under_dir "$target" "$MEM" 2>/dev/null || proposal "path-escape:file=$FILE"
-    write_auto "$target" "$MEM"
+    append_memory_file "$target" "$MEM"
     ;;
 
   CREATE_SKILL|CREATE_COMMAND)
@@ -388,11 +417,15 @@ case "$ACTION" in
     write_proposal "$target_dir" "" ""
     ;;
 
-  UPDATE_CLAUDE)
-    [ "$SCOPE" = "project" ] || proposal "global-claude-md-not-supported"
+  UPDATE_CLAUDE|UPDATE_AGENTS)
+    [ "$SCOPE" = "project" ] || proposal "global-runtime-md-not-supported"
     [ -n "$SECTION" ]  || proposal "missing-section"
     [ -n "$ADDITION" ] || proposal "missing-addition"
-    target="$PROJECT_ROOT/CLAUDE.md"
+    if [ "$ACTION" = "UPDATE_CLAUDE" ]; then
+      target="$PROJECT_ROOT/CLAUDE.md"
+    else
+      target="$PROJECT_ROOT/AGENTS.md"
+    fi
     write_proposal "$PROPOSALS_DIR_PROJECT" "" "$target"
     ;;
 

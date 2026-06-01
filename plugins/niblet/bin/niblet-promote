@@ -182,16 +182,20 @@ esac
 # proposal with `target: README.md` (or any other path under the project)
 # would otherwise pass the containment check below and silently mutate a
 # different file. We overwrite TARGET *before* containment runs.
-if [ "$ACTION" = "UPDATE_CLAUDE" ]; then
-  ENFORCED_TARGET="$(niblet_project_root "$PWD")/CLAUDE.md"
+if [ "$ACTION" = "UPDATE_CLAUDE" ] || [ "$ACTION" = "UPDATE_AGENTS" ]; then
+  if [ "$ACTION" = "UPDATE_CLAUDE" ]; then
+    ENFORCED_TARGET="$(niblet_project_root "$PWD")/CLAUDE.md"
+  else
+    ENFORCED_TARGET="$(niblet_project_root "$PWD")/AGENTS.md"
+  fi
   # Compare in canonical form so /var ↔ /private/var (macOS) doesn't trip
   # the tampering warning when the proposal envelope and current process
   # happen to use different symlink paths to the same file.
   TARGET_CANON="$(niblet_canonical_path "$TARGET" 2>/dev/null || printf '%s' "$TARGET")"
   ENFORCED_CANON="$(niblet_canonical_path "$ENFORCED_TARGET" 2>/dev/null || printf '%s' "$ENFORCED_TARGET")"
   if [ "$TARGET_CANON" != "$ENFORCED_CANON" ]; then
-    printf 'warning: UPDATE_CLAUDE target overridden from %s to %s\n' \
-      "$TARGET" "$ENFORCED_TARGET" >&2
+    printf 'warning: %s target overridden from %s to %s\n' \
+      "$ACTION" "$TARGET" "$ENFORCED_TARGET" >&2
   fi
   TARGET="$ENFORCED_TARGET"
 fi
@@ -219,11 +223,10 @@ allowed_root() {
       local kind; kind="$(artifact_kind_for_action "$ACTION")"
       niblet_artifact_dir "$kind" "$SCOPE" "$pr"
       ;;
-    UPDATE_CLAUDE)
-      # Allowed root for UPDATE_CLAUDE is intentionally a directory whose
-      # only legal child is CLAUDE.md — we still containment-check below
-      # that the (already-clamped) TARGET equals that exact file. Returning
-      # `$pr` here would let a tampered target like README.md sail through.
+    UPDATE_CLAUDE|UPDATE_AGENTS)
+      # Allowed root is intentionally the project root; the target is
+      # hard-clamped below to CLAUDE.md or AGENTS.md respectively so a
+      # tampered target like README.md cannot sail through.
       echo "$pr"
       ;;
     *)
@@ -326,8 +329,8 @@ case "$ACTION" in
     rm -f "$PROPOSAL"
     ;;
 
-  UPDATE_CLAUDE)
-    [ -n "$SECTION" ] || { echo "UPDATE_CLAUDE missing 'section'" >&2; exit 65; }
+  UPDATE_CLAUDE|UPDATE_AGENTS)
+    [ -n "$SECTION" ] || { echo "$ACTION missing 'section'" >&2; exit 65; }
     local_payload="$(extract_payload)"
     if [ ! -f "$TARGET" ]; then
       {
@@ -335,7 +338,7 @@ case "$ACTION" in
         echo ""
         printf '%s\n' "$local_payload"
       } > "$TARGET"
-      echo "promoted: UPDATE_CLAUDE -> $TARGET (created)"
+      echo "promoted: $ACTION -> $TARGET (created)"
       rm -f "$PROPOSAL"
       exit 0
     fi
@@ -370,11 +373,11 @@ case "$ACTION" in
     set -e
     if [ "$AWK_RC" = "0" ]; then
       mv "$tmp" "$TARGET"
-      echo "promoted: UPDATE_CLAUDE -> $TARGET (appended under '$SECTION')"
+      echo "promoted: $ACTION -> $TARGET (appended under '$SECTION')"
     else
       rm -f "$tmp"
       printf '\n## %s\n\n%s\n' "$SECTION" "$local_payload" >> "$TARGET"
-      echo "promoted: UPDATE_CLAUDE -> $TARGET (added section '$SECTION')"
+      echo "promoted: $ACTION -> $TARGET (added section '$SECTION')"
     fi
     rm -f "$PROPOSAL"
     ;;

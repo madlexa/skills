@@ -15,8 +15,8 @@ then emit a JSONL block of corrective actions.
 The parent's prompt names these paths explicitly:
 
 - **Artifact index** — filenames-only JSONL at `.niblet/index/artifacts.jsonl`
-- **KB directory** — all current KB entries (`.claude/kb/`)
-- **Memory directory** — all feedback/correction records (`.claude/memory/`)
+- **KB directory** — all current KB entries (`.claude/kb/` or `.kimi/kb/` depending on runtime)
+- **Memory directory** — all feedback/correction records (`.claude/memory/` or `.kimi/memory/` depending on runtime)
 - **Digests directory** — sanitized session summaries (`.niblet/digests/`)
 - **Project root**
 
