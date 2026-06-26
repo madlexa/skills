@@ -26,7 +26,7 @@
     "shortDescription": "Session knowledge keeper for Kimi Code CLI",
     "longDescription": "Niblet quietly captures discoveries, workflow patterns, and user feedback across AI coding sessions. It auto-writes KB entries and memory feedback, then proposes skills, agents, commands, scripts, and AGENTS.md/CLAUDE.md updates for human review."
   },
-  "skills": "./skills/niblet",
+  "skills": "./skills/",
   "sessionStart": {
     "skill": "niblet"
   },

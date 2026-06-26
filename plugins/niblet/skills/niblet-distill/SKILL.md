@@ -1,13 +1,57 @@
 ---
 name: niblet-distill
-description: Sub-agent spawned by the niblet plugin to consolidate and deduplicate KB entries, memory files, and workflow patterns when the KB exceeds a size threshold or when the user runs /niblet-distill. Has independent context — does not see the parent session. Use only via Task tool invocation triggered by a NIBLET CHECKPOINT (distill) or by the /niblet-distill command.
+description: Use when the user types /niblet-distill or when niblet-compact/niblet-wrap-up reports thresholds exceeded.
+user-invocable: true
 ---
 
-# niblet-distill
+# /niblet-distill
+
+## Overview
+
+Run the niblet-distill consolidation sub-agent to deduplicate and compress the project's KB, memory, skills, agents, and commands.
+
+## When to use
+
+- User types `/niblet-distill`.
+- User asks to run niblet-distill manually.
+- After `niblet-compact` or `niblet-wrap-up` reports thresholds exceeded.
+
+## Steps
+
+1. Determine `PROJECT_ROOT`:
+   - Start from the current working directory.
+   - If inside a git repository, use `git rev-parse --show-toplevel`.
+   - Otherwise use the current working directory.
+2. Spawn a coder subagent with the prompt in the **niblet-distill sub-agent prompt** section below, passing:
+   - Project root: `PROJECT_ROOT`
+   - KB directory: `$PROJECT_ROOT/.claude/kb/`
+   - Memory directory: `$PROJECT_ROOT/.claude/memory/`
+   - Digests directory: `$PROJECT_ROOT/.niblet/digests/`
+   - Skills directory: `$PROJECT_ROOT/.claude/skills/`
+   - Agents directory: `$PROJECT_ROOT/.claude/agents/`
+   - Commands directory: `$PROJECT_ROOT/.claude/commands/`
+3. The subagent returns a JSONL block of actions between `<<<NIBLET ACTIONS BEGIN>>>` and `<<<NIBLET ACTIONS END>>>`. Parse it.
+4. For each parsed action, call the `niblet_apply` MCP tool with:
+   ```json
+   {
+     "project_root": "PROJECT_ROOT",
+     "action": { "action": "...", ... }
+   }
+   ```
+   Call it once per action. Do not batch multiple actions into one call.
+5. Report which actions were applied vs proposed. Do NOT write skills/agents/commands/CLAUDE.md directly.
+
+## Safety
+
+- Only emit/apply actions returned by the subagent.
+- All writes go through the `niblet_apply` MCP tool.
+- Do not auto-trigger this skill unless the user explicitly asked for distillation or a threshold checkpoint was reached.
+
+## niblet-distill sub-agent prompt
 
 You are a knowledge-base distiller. Find redundancy, outdated entries, and stable multi-session patterns, then emit a JSONL block of consolidation actions.
 
-## Inputs
+### Inputs
 
 The parent prompt names these paths:
 
@@ -19,7 +63,7 @@ The parent prompt names these paths:
 - **Commands directory** — existing command definitions (`.claude/commands/`)
 - **Project root**
 
-## Method
+### Method
 
 1. Read all KB entries, skills, agents, commands, and scripts. Look for:
    - Same topic from different angles → `MERGE_KB_ENTRY`
@@ -44,7 +88,7 @@ The parent prompt names these paths:
 
 6. Output **ONLY** a JSONL block between the sentinels. No prose, no preamble.
 
-## Output format
+### Output format
 
 ```
 <<<NIBLET ACTIONS BEGIN>>>
@@ -54,7 +98,7 @@ The parent prompt names these paths:
 
 One JSON object per line. All values are strings. Encode newlines inside `content` as `\n`.
 
-## Consolidation rules
+### Consolidation rules
 
 Be aggressive about shrinking the KB while preserving or improving coverage:
 
@@ -74,7 +118,7 @@ Skill/agent/command checks:
 
 Only propose changes when you have read the current artifact content and the evidence is strong.
 
-## Allowed actions
+### Allowed actions
 
 | `action` | Required fields | Notes |
 |---|---|---|
@@ -105,7 +149,7 @@ All actions must include `reason` (one sentence) and `confidence`. `beginner_sum
 
 Do NOT invent fields like `source` or `target`.
 
-## What NOT to emit
+### What NOT to emit
 
 - More than 5 actions per pass.
 - Actions that make the KB larger rather than smaller or sharper.
@@ -113,7 +157,7 @@ Do NOT invent fields like `source` or `target`.
 - `DEPRECATE_KB_ENTRY` without confirming the content is genuinely outdated.
 - Anything derivable by reading the source code.
 
-## Empty-distill output
+### Empty-distill output
 
 ```
 <<<NIBLET ACTIONS BEGIN>>>

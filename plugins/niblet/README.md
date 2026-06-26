@@ -103,6 +103,20 @@ MCP tools explicitly:
 - When reviewing proposals → `niblet_promote` with the proposal file path to
   apply it.
 
+## Manual distillation
+
+You can trigger KB consolidation manually at any time:
+
+- **Claude Code:** type `/niblet-distill`.
+- **Kimi Code CLI:** type `/niblet-distill`.
+
+Both run the same `niblet-distill` sub-agent that reads the KB, memory,
+digests, skills, agents, and commands, then emits at most 5 consolidation
+actions. Safe actions (`MERGE_KB_ENTRY`, `UPDATE_KB_ENTRY`,
+`DEPRECATE_KB_ENTRY`) are auto-written; higher-impact actions
+(`CREATE_SKILL`, `CREATE_AGENT`, `CREATE_COMMAND`, `UPDATE_CLAUDE`) are
+staged as proposals for your review.
+
 ## Platform support & requirements
 
 Niblet ships as POSIX shell scripts. They run natively on **macOS** and
@@ -404,7 +418,10 @@ Project-local `.niblet/`, `.claude/kb/`, and any pending proposals are
 niblet/
 ├── .claude-plugin/plugin.json         # Claude Code plugin manifest
 ├── kimi.plugin.json                   # Kimi Code CLI plugin manifest + MCP server
-├── skills/niblet/SKILL.md             # how agent reacts to checkpoints
+├── skills/
+│   ├── niblet/SKILL.md                # how agent reacts to checkpoints (Kimi + Claude)
+│   └── niblet-distill/SKILL.md        # manual `/niblet-distill` skill (Kimi)
+├── commands/niblet-distill.md         # manual `/niblet-distill` command (Claude)
 ├── agents/
 │   ├── niblet-deep.md                 # sub-agent prompt for DEEP layer
 │   ├── niblet-distill.md              # sub-agent prompt for DISTILL layer
