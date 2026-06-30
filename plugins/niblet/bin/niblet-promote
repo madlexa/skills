@@ -40,6 +40,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 . "$SCRIPT_DIR/../lib/paths.sh"
 . "$SCRIPT_DIR/../lib/sanitize.sh"
 
+# Save the current live version of an artifact before overwriting it.
+# Uses the Python versioning helper so all backups live under .niblet/versions/.
+save_version() {
+  local action="$1" name="$2"
+  local project_root
+  project_root="$(niblet_project_root "$PWD")"
+  "$SCRIPT_DIR/niblet-versioning" --project-root "$project_root" save \
+    --action "$action" --name "$name" >/dev/null 2>&1 || true
+}
+
 # --- guarded-sweep mode ---
 # When NIBLET_GUARDED_APPLY=1, scans proposals dir and auto-promotes any
 # MERGE_KB_ENTRY or UPDATE_KB_ENTRY proposal that has risk=low, confidence=high,
@@ -163,6 +173,8 @@ ACTION="$(envelope_field action)"
 SCOPE="$( envelope_field scope)"
 TARGET="$(envelope_field target)"
 SECTION="$(envelope_field section)"
+NAME="$(  envelope_field name)"
+TOPIC="$( envelope_field topic)"
 
 [ -n "$ACTION" ] || { echo "proposal missing 'action' field" >&2; exit 65; }
 
@@ -284,7 +296,7 @@ case "$ACTION" in
 
   UPDATE_SKILL|UPDATE_AGENT|UPDATE_COMMAND|MERGE_SKILL|MERGE_AGENT)
     mkdir -p "$(dirname "$TARGET")"
-    [ -f "$TARGET" ] && cp "$TARGET" "${TARGET}.niblet-backup"
+    save_version "$ACTION" "$NAME"
     extract_payload > "$TARGET"
     echo "promoted: $ACTION -> $TARGET"
     rm -f "$PROPOSAL"
@@ -305,7 +317,7 @@ case "$ACTION" in
       exit 65
     fi
     mkdir -p "$(dirname "$TARGET")"
-    [ -f "$TARGET" ] && cp "$TARGET" "${TARGET}.niblet-backup"
+    save_version "$ACTION" "$NAME"
     cat "$_tmp_script" > "$TARGET"
     rm -f "$_tmp_script"
     chmod a-x "$TARGET" 2>/dev/null || true
@@ -315,6 +327,7 @@ case "$ACTION" in
 
   MERGE_KB_ENTRY|UPDATE_KB_ENTRY)
     mkdir -p "$(dirname "$TARGET")"
+    save_version "$ACTION" "$TOPIC"
     extract_payload > "$TARGET"
     echo "promoted: $ACTION -> $TARGET"
     rm -f "$PROPOSAL"
@@ -332,6 +345,7 @@ case "$ACTION" in
 
   UPDATE_CLAUDE|UPDATE_AGENTS)
     [ -n "$SECTION" ] || { echo "$ACTION missing 'section'" >&2; exit 65; }
+    save_version "$ACTION" "$SECTION"
     local_payload="$(extract_payload)"
     if [ ! -f "$TARGET" ]; then
       {

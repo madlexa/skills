@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.6.0
+
+- **Ratchet loop.** `niblet-ratchet` auto-promotes `UPDATE_*` proposals when the
+  live artifact is underperforming (usage >= 3, success_rate < 0.5). CREATE_*
+  proposals always stay in review. Every promotion still saves the previous
+  version to `.niblet/versions/`.
+- **Metrics dashboard.** `niblet-metrics` aggregates skill and pipeline usage
+  from `.niblet/metrics/*.jsonl` and flags underperforming artifacts.
+- **File-based versioning.** `niblet-versioning` / `niblet-revert` keep
+  timestamped copies under `.niblet/versions/`; `niblet-promote` saves a version
+  before overwriting live artifacts.
+- **Unified Python core.** Newer tools (`capture-task`, `metrics`, `versioning`,
+  `ratchet`, `revert`, `pipelines`, `capture-read`) share a single Python package
+  under `src/niblet/`. The `bin/` scripts are thin wrappers around
+  `python3 -m niblet <subcommand>`.
+- **KB as side effect of reading.** `niblet-capture-read` (Claude hook + Kimi MCP
+  tool) counts reads/edits per component. Once a component reaches the threshold,
+  a code-walker checkpoint is queued so the next prompt can spawn the sub-agent
+  and distill a component-level KB entry.
+- **Pipelines as first-class citizens.** Reusable workflows live under
+  `.niblet/pipelines/` and can be listed, shown, and run via `niblet-pipelines`.
+  Usage is recorded in `.niblet/metrics/pipelines.jsonl`.
+- **Autonomous maintenance mode.** `niblet-maintain` runs ratchet, gardener, and
+  a queue report in one pass. A daily cron reminder can invoke it automatically.
+
 ## 0.4.1
 
 - **Kimi Code CLI support.** Niblet now ships as a Kimi Code CLI plugin

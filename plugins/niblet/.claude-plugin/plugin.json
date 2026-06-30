@@ -1,7 +1,7 @@
 {
   "name": "niblet",
   "displayName": "Niblet",
-  "version": "0.4.2",
+  "version": "0.6.0",
   "description": "The diligent crumb-keeper for AI coding sessions. After every turn, Niblet writes findings to the project KB (auto). At SessionEnd a sub-agent extracts workflow patterns and lands them as proposals you review before promotion. Sanitized capture — no tool content stored. Hook-driven, per-session isolated, with auto-gitignore. Includes KB distillation, periodic artifact auditing, niblet-status dashboard, and opt-in guarded auto-promotion. Runs on macOS/Linux; Windows via WSL2 or Git Bash.",
   "author": {
     "name": "madlexa"

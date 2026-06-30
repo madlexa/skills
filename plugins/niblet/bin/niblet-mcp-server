@@ -37,7 +37,7 @@ handle_initialize() {
   # Echo back the protocol version requested by the client; kimi-code 0.14.3
   # sends "2025-11-25" and expects the server to agree.
   protocol_version="$(printf '%s' "$payload" | jq -r '.params.protocolVersion // "2024-11-05"')"
-  send "{\"jsonrpc\":\"2.0\",\"id\":$(json_id "$id"),\"result\":{\"protocolVersion\":$(printf '%s' "$protocol_version" | jq -R .),\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"niblet\",\"version\":\"0.4.1\"}}}"
+  send "{\"jsonrpc\":\"2.0\",\"id\":$(json_id "$id"),\"result\":{\"protocolVersion\":$(printf '%s' "$protocol_version" | jq -R .),\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"niblet\",\"version\":\"0.6.0\"}}}"
 }
 
 handle_tools_list() {
@@ -93,6 +93,53 @@ handle_tools_list() {
         },
         "required": ["proposal_file"]
       }
+    },
+    {
+      "name": "niblet_capture_task",
+      "description": "Record a completed agent task, its components, skills used, files touched, outcome, and optional user feedback. Writes a task record to .niblet/tasks/<session>.jsonl and skill usage metrics to .niblet/metrics/skills.jsonl. Call once at the end of a task instead of logging every tool call.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_root": {"type": "string", "description": "Absolute path to the project root"},
+          "session_id": {"type": "string", "description": "Current session ID"},
+          "summary": {"type": "string", "description": "One-sentence summary of what the task accomplished"},
+          "components": {"type": "array", "items": {"type": "string"}, "description": "Component slugs touched in this task"},
+          "skills": {"type": "array", "items": {"type": "string"}, "description": "Skills or pipelines used during the task"},
+          "files_read": {"type": "array", "items": {"type": "string"}, "description": "Project-relative file paths read"},
+          "files_modified": {"type": "array", "items": {"type": "string"}, "description": "Project-relative file paths modified"},
+          "outcome": {"type": "string", "enum": ["success", "failure", "cancelled"], "description": "Task outcome"},
+          "feedback": {"type": "string", "description": "Optional user feedback; written to memory if outcome is failure or cancelled"}
+        },
+        "required": ["project_root", "session_id"]
+      }
+    },
+    {
+      "name": "niblet_capture_read",
+      "description": "Record that the agent read or edited a file. Niblet tracks how many files have been touched per component and queues a code-walker job when a component has been explored enough. This is the KB-as-side-effect path: durable knowledge is created while the agent reads files for its actual tasks.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_root": {"type": "string", "description": "Absolute path to the project root"},
+          "session_id": {"type": "string", "description": "Current session ID"},
+          "path": {"type": "string", "description": "Project-relative file path that was read or edited"},
+          "tool": {"type": "string", "enum": ["Read", "Edit", "Write", "MultiEdit", "NotebookEdit"], "description": "Tool that touched the file"}
+        },
+        "required": ["project_root", "session_id", "path"]
+      }
+    },
+    {
+      "name": "niblet_run_pipeline",
+      "description": "Print a named niblet pipeline and record that it was used. Pipelines are reusable workflows stored under .niblet/pipelines/.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_root": {"type": "string", "description": "Absolute path to the project root"},
+          "session_id": {"type": "string", "description": "Current session ID"},
+          "name": {"type": "string", "description": "Pipeline name"},
+          "success": {"type": "boolean", "description": "Whether the pipeline run succeeded", "default": true}
+        },
+        "required": ["project_root", "session_id", "name"]
+      }
     }
   ]'
   # MCP stdio transport expects each JSON-RPC message on a single line (NDJSON).
@@ -147,6 +194,68 @@ handle_tools_call() {
       stderr="$(cat "$tmpfile.stderr" 2>/dev/null || true)"
       set -e
       rm -f "$tmpfile" "$tmpfile.stderr"
+      ;;
+    niblet_capture_task)
+      project_root="$(printf '%s' "$args" | jq -r '.project_root // empty')"
+      session_id="$(printf '%s' "$args" | jq -r '.session_id // empty')"
+      summary="$(printf '%s' "$args" | jq -r '.summary // empty')"
+      components="$(printf '%s' "$args" | jq -r '(.components // []) | join(",")')"
+      skills="$(printf '%s' "$args" | jq -r '(.skills // []) | join(",")')"
+      files_read="$(printf '%s' "$args" | jq -r '(.files_read // []) | join(",")')"
+      files_modified="$(printf '%s' "$args" | jq -r '(.files_modified // []) | join(",")')"
+      outcome="$(printf '%s' "$args" | jq -r '.outcome // "success"')"
+      feedback="$(printf '%s' "$args" | jq -r '.feedback // empty')"
+      stderr_file="$(mktemp)"
+      set +e
+      output="$("$SCRIPT_DIR/niblet-capture-task" \
+        --project-root "$project_root" \
+        --session-id "$session_id" \
+        --summary "$summary" \
+        --components "$components" \
+        --skills "$skills" \
+        --files-read "$files_read" \
+        --files-modified "$files_modified" \
+        --outcome "$outcome" \
+        --feedback "$feedback" 2>"$stderr_file")"
+      exit_code=$?
+      stderr="$(cat "$stderr_file" 2>/dev/null || true)"
+      set -e
+      rm -f "$stderr_file"
+      ;;
+    niblet_capture_read)
+      project_root="$(printf '%s' "$args" | jq -r '.project_root // empty')"
+      session_id="$(printf '%s' "$args" | jq -r '.session_id // empty')"
+      read_path="$(printf '%s' "$args" | jq -r '.path // empty')"
+      tool_name="$(printf '%s' "$args" | jq -r '.tool // "Read"')"
+      stderr_file="$(mktemp)"
+      set +e
+      output="$("$SCRIPT_DIR/niblet-capture-read" \
+        --project-root "$project_root" \
+        --session "$session_id" \
+        --path "$read_path" \
+        --tool "$tool_name" 2>"$stderr_file")"
+      exit_code=$?
+      stderr="$(cat "$stderr_file" 2>/dev/null || true)"
+      set -e
+      rm -f "$stderr_file"
+      ;;
+    niblet_run_pipeline)
+      project_root="$(printf '%s' "$args" | jq -r '.project_root // empty')"
+      session_id="$(printf '%s' "$args" | jq -r '.session_id // empty')"
+      pipeline_name="$(printf '%s' "$args" | jq -r '.name // empty')"
+      pipeline_success="$(printf '%s' "$args" | jq -r '.success // true')"
+      stderr_file="$(mktemp)"
+      set +e
+      output="$("$SCRIPT_DIR/niblet-pipelines" \
+        --project-root "$project_root" \
+        run \
+        --name "$pipeline_name" \
+        --session-id "$session_id" \
+        --success "$pipeline_success" 2>"$stderr_file")"
+      exit_code=$?
+      stderr="$(cat "$stderr_file" 2>/dev/null || true)"
+      set -e
+      rm -f "$stderr_file"
       ;;
     "")
       mcp_error "$id" -32600 "Missing tool name"

@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Thin wrapper around the unified Python niblet CLI.
+set -e
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+export PYTHONPATH="${SCRIPT_DIR}/../src${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m niblet capture-task "$@"

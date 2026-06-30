@@ -80,4 +80,19 @@ EVENT="$(printf '{"ts":"%s","session":"%s","phase":"%s","tool":"%s","path":"%s",
 RAW_FILE="$STORE/raw/${SESSION}.jsonl"
 jsonl_append "$RAW_FILE" "$EVENT"
 
+# Track reads/edits per component. When a component has been explored enough,
+# queue a code-walker job so the next prompt can spawn the sub-agent to distill
+# component-level KB entries as a side effect of normal file reading.
+case "$TOOL" in
+  Read|Edit|Write|MultiEdit|NotebookEdit)
+    if [ "$PHASE" = "post" ] && [ -n "$SAFE_PATH" ]; then
+      "$SCRIPT_DIR/../bin/niblet-capture-read" \
+        --project-root "$PROJECT_ROOT" \
+        --session "$SESSION" \
+        --path "$SAFE_PATH" \
+        --tool "$TOOL" >/dev/null 2>&1 || true
+    fi
+    ;;
+esac
+
 exit 0

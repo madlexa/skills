@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# smoke_test.sh — end-to-end test of niblet v0.4.2 contract.
+# smoke_test.sh — end-to-end test of niblet v0.6.0 contract.
 #
 # Tests security boundary + lifecycle, not just plumbing:
 #
@@ -733,14 +733,15 @@ UPDATE_PROP="$(ls -t "$STORE/proposals"/*UPDATE_SKILL* 2>/dev/null | head -n1)"
   || fail "no UPDATE_SKILL proposal found"
 if [ -n "$UPDATE_PROP" ]; then
   ( cd "$PROJECT" && "$BIN/niblet-promote" "$UPDATE_PROP" >/dev/null )
-  [ -f "${SKILL_TARGET}.niblet-backup" ] && pass "UPDATE_SKILL backup created at .niblet-backup" \
-    || fail "no backup file at ${SKILL_TARGET}.niblet-backup"
+  _version_file="$(find "$STORE/versions/skills/my-skill" -maxdepth 1 -name '*.md' 2>/dev/null | head -n1)"
+  [ -n "$_version_file" ] && pass "UPDATE_SKILL version saved under .niblet/versions" \
+    || fail "no version file found under $STORE/versions/skills/my-skill"
   grep -q "updated body content" "$SKILL_TARGET" && pass "UPDATE_SKILL payload written to target" \
     || fail "UPDATE_SKILL payload not written"
-  # Verify backup has same content as the file had before promote.
-  _backup_hash="$(shasum "${SKILL_TARGET}.niblet-backup" | cut -d' ' -f1)"
-  [ "$ORIG_HASH" = "$_backup_hash" ] && pass "backup contains original content" \
-    || fail "backup content wrong: orig=$ORIG_HASH backup=$_backup_hash"
+  # Verify saved version has same content as the file had before promote.
+  _version_hash="$(shasum "$_version_file" | cut -d' ' -f1)"
+  [ "$ORIG_HASH" = "$_version_hash" ] && pass "saved version contains original content" \
+    || fail "version content wrong: orig=$ORIG_HASH version=$_version_hash"
 fi
 
 title "34. niblet-promote DEPRECATE_KB_ENTRY → renames to .deprecated"
@@ -1166,20 +1167,20 @@ GA_UPD_PROP="$GA_PROP_DIR/$(date -u +%Y%m%dT%H%M%SZ)-UPDATE_KB_ENTRY-ga-update-t
   echo "# Updated content for backup test"
 } > "$GA_UPD_PROP"
 NIBLET_GUARDED_APPLY=1 "$BIN/niblet-promote" --guarded-sweep --project-root "$PROJECT" >/dev/null
-# Timestamped backup must exist.
-_backup_count="$(find "$(dirname "$GA_UPD_TARGET")" -maxdepth 1 \
-  -name "$(basename "$GA_UPD_TARGET").niblet-backup.*" 2>/dev/null | wc -l | tr -d ' ')"
+# Versioned backup must exist under .niblet/versions/kb/ga-update-test.md/.
+GA_UPD_TOPIC="ga-update-test.md"
+GA_UPD_VERSION_DIR="$STORE/versions/kb/$GA_UPD_TOPIC"
+_backup_count="$(find "$GA_UPD_VERSION_DIR" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
 [ "$_backup_count" -ge "1" ] \
-  && pass "UPDATE_KB_ENTRY guarded auto-promote creates timestamped backup" \
-  || fail "no timestamped backup found for guarded UPDATE_KB_ENTRY"
+  && pass "UPDATE_KB_ENTRY guarded auto-promote creates versioned backup" \
+  || fail "no versioned backup found under $GA_UPD_VERSION_DIR"
 grep -q "# Updated content for backup test" "$GA_UPD_TARGET" \
-  && pass "UPDATE_KB_ENTRY payload written after timestamped backup" \
+  && pass "UPDATE_KB_ENTRY payload written after versioned backup" \
   || fail "UPDATE_KB_ENTRY payload not written"
-_backup_file="$(find "$(dirname "$GA_UPD_TARGET")" -maxdepth 1 \
-  -name "$(basename "$GA_UPD_TARGET").niblet-backup.*" 2>/dev/null | head -n1)"
+_backup_file="$(find "$GA_UPD_VERSION_DIR" -maxdepth 1 -type f -name '*.md' 2>/dev/null | head -n1)"
 [ -n "$_backup_file" ] && grep -q "# Original for backup test" "$_backup_file" \
-  && pass "timestamped backup contains original content" \
-  || fail "timestamped backup content wrong"
+  && pass "versioned backup contains original content" \
+  || fail "versioned backup content wrong"
 
 title "52. guarded-apply: UPDATE_SKILL (high-impact) not auto-promoted by guarded-sweep"
 GA_SKILL_PROP="$GA_PROP_DIR/$(date -u +%Y%m%dT%H%M%SZ)-UPDATE_SKILL-ga-skill-test.md"

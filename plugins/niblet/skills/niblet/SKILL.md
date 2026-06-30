@@ -20,6 +20,12 @@ Niblet captures discoveries, workflow patterns, and user feedback across AI codi
 
 Skills and AGENTS.md affect every session and are checked into git — they require human review.
 
+## Program constitution
+
+At the start of every session, read `<project>/.niblet/program.md` if it exists. It defines this project's knowledge taxonomy, auto-write policy, improvement criteria, and platform-specific rules. Follow it over any generic niblet defaults.
+
+If the program is missing or invalid, mention it once to the user and continue with the generic defaults below.
+
 ## Configuration (`.niblet/config`)
 
 | Variable | Default | Purpose |
@@ -69,22 +75,25 @@ The MCP server runs inside the plugin install directory, not the project. Every 
 }
 ```
 
-### Log every file mutation immediately
+### Capture the task once it completes
 
-After `Write`, `Edit`, or file-mutating `Bash`, call `niblet_log`:
+Do not log every individual tool call. At the end of each task, call `niblet_capture_task` with a structured summary:
 
 ```json
 {
   "project_root": "/abs/path/to/project",
   "session_id": "<id>",
-  "tool": "WriteFile|Edit|Bash",
-  "path": "src/main.py",
-  "exit_code": "0",
-  "success": true
+  "summary": "One-sentence description of what was accomplished",
+  "components": ["niblet-status", "niblet-program"],
+  "skills": ["writing-plans", "test-driven-development"],
+  "files_read": ["plugins/niblet/bin/niblet-status"],
+  "files_modified": ["plugins/niblet/bin/niblet-status", "plugins/niblet/skills/niblet/SKILL.md"],
+  "outcome": "success",
+  "feedback": ""
 }
 ```
 
-For Bash, leave `path` empty and set `exit_code`.
+`outcome` is `"success"`, `"failure"`, or `"cancelled"`. Include `feedback` only when the user gave a correction or negative signal.
 
 ### Capture interruptions and negative feedback first
 

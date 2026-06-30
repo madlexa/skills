@@ -46,6 +46,8 @@ PROPOSALS_DIR="$STORE/proposals"
 IDX_FILE="$STORE/index/artifacts.jsonl"
 DISTILL_DIR="$STORE/distill_queue"
 AUDIT_DIR="$STORE/audit_queue"
+CODE_WALKER_DIR="$STORE/code_walker_queue"
+PIPELINES_DIR="$STORE/pipelines"
 BEGINNER="${NIBLET_BEGINNER_UX:-0}"
 
 # ---- counts ----
@@ -63,6 +65,12 @@ distill_count=0
 
 audit_count=0
 [ -d "$AUDIT_DIR" ] && audit_count="$(find "$AUDIT_DIR" -maxdepth 1 -type f -name '*.audit' 2>/dev/null | wc -l | tr -d ' ')"
+
+code_walker_count=0
+[ -d "$CODE_WALKER_DIR" ] && code_walker_count="$(find "$CODE_WALKER_DIR" -maxdepth 1 -type f \( -name '*.queue' -o -name '*.claimed-*' \) 2>/dev/null | wc -l | tr -d ' ')"
+
+pipeline_count=0
+[ -d "$PIPELINES_DIR" ] && pipeline_count="$(find "$PIPELINES_DIR" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
 
 session_count=0
 if [ -f "$STORE/session_count" ]; then
@@ -90,9 +98,20 @@ scripts_count="$(_artifact_count "$SCRIPTS_DIR")"
 # ---- print ----
 printf 'niblet status: %s\n' "$PROJECT_ROOT"
 printf '\n'
+PROGRAM_VALID="missing"
+PROGRAM_PATH="$PROJECT_ROOT/.niblet/program.md"
+if [ -f "$PROGRAM_PATH" ]; then
+  if "$SCRIPT_DIR/niblet-program" --project-root "$PROJECT_ROOT" --validate >/dev/null 2>&1; then
+    PROGRAM_VALID="valid"
+  else
+    PROGRAM_VALID="invalid"
+  fi
+fi
+
 printf 'Configuration\n'
 printf '  Config path:    %s\n' "$PROJECT_ROOT/.niblet/config"
 printf '  Auto-promote:   %s\n' "${NIBLET_AUTO_PROMOTE:-0}"
+printf '  Program:        %s (%s)\n' "$PROGRAM_PATH" "$PROGRAM_VALID"
 printf '\n'
 printf 'Knowledge base\n'
 printf '  KB path:        %s\n' "$KB_DIR"
@@ -134,11 +153,24 @@ printf '  agents:   %s\n' "$agents_count"
 printf '  commands: %s\n' "$commands_count"
 printf '  scripts:  %s\n' "$scripts_count"
 
+versions_count=0
+[ -d "$STORE/versions" ] && versions_count="$(find "$STORE/versions" -type f -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
+printf '\n'
+printf 'Versions\n'
+printf '  versioned artifacts: %s\n' "$versions_count"
+printf '  versions path:       %s\n' "$STORE/versions"
+
 printf '\n'
 printf 'Queue depths\n'
-printf '  distill_queue:  %s\n' "$distill_count"
-printf '  audit_queue:    %s\n' "$audit_count"
-printf '  sessions seen:  %s\n' "$session_count"
+printf '  distill_queue:    %s\n' "$distill_count"
+printf '  audit_queue:      %s\n' "$audit_count"
+printf '  code_walker_queue: %s\n' "$code_walker_count"
+printf '  sessions seen:    %s\n' "$session_count"
+
+printf '\n'
+printf 'Pipelines\n'
+printf '  pipeline definitions: %s\n' "$pipeline_count"
+printf '  pipelines path:       %s\n' "$PIPELINES_DIR"
 
 printf '\n'
 if [ "$BEGINNER" = "1" ]; then
@@ -156,7 +188,11 @@ if [ "$BEGINNER" = "1" ]; then
     printf '  A knowledge-audit task is queued (%s entry).\n' "$audit_count"
     printf '  It will run automatically at the start of the next session.\n'
   fi
-  if [ "$proposal_count" = "0" ] && [ "$distill_count" = "0" ] && [ "$audit_count" = "0" ]; then
+  if [ "$code_walker_count" -gt 0 ]; then
+    printf '  A code-walker task is queued (%s entry).\n' "$code_walker_count"
+    printf '  It will run automatically at the start of the next session.\n'
+  fi
+  if [ "$proposal_count" = "0" ] && [ "$distill_count" = "0" ] && [ "$audit_count" = "0" ] && [ "$code_walker_count" = "0" ]; then
     printf '  Everything looks up to date. No action required.\n'
   fi
 else
@@ -171,7 +207,10 @@ else
   if [ "$audit_count" -gt 0 ]; then
     printf '  Audit checkpoint pending (%s entry). Will emit next session.\n' "$audit_count"
   fi
-  if [ "$proposal_count" = "0" ] && [ "$distill_count" = "0" ] && [ "$audit_count" = "0" ]; then
+  if [ "$code_walker_count" -gt 0 ]; then
+    printf '  Code-walker checkpoint pending (%s entry). Will emit next session.\n' "$code_walker_count"
+  fi
+  if [ "$proposal_count" = "0" ] && [ "$distill_count" = "0" ] && [ "$audit_count" = "0" ] && [ "$code_walker_count" = "0" ]; then
     printf '  No pending work.\n'
   fi
 fi

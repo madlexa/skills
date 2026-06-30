@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# niblet-maintain — autonomous maintenance pass.
+#
+# Runs the parts of niblet that can be automated without an agent:
+#   1. Ratchet loop (auto-promote underperforming UPDATE_* proposals).
+#   2. Skill gardener (auto-promote eligible low-risk proposals if enabled).
+#   3. Queue report (deep/audit/distill/code-walker still need agent reasoning).
+#
+# Usage:
+#   niblet-maintain [--project-root <abs-path>] [--dry-run]
+#
+# Environment:
+#   NIBLET_AUTO_PROMOTE=1   allow gardener to promote eligible proposals
+#   Without it, the script only reports what it would do.
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+. "$SCRIPT_DIR/../lib/paths.sh"
+. "$SCRIPT_DIR/../lib/config.sh"
+
+PROJECT_ROOT=""
+DRY_RUN=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --project-root)
+      PROJECT_ROOT="$2"
+      shift 2
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    -h|--help)
+      printf 'Usage: %s [--project-root <abs-path>] [--dry-run]\n' "${0##*/}"
+      exit 0
+      ;;
+    -*)
+      printf 'unknown option: %s\n' "$1" >&2
+      exit 64
+      ;;
+    *)
+      PROJECT_ROOT="$1"
+      shift
+      ;;
+  esac
+done
+
+[ -n "$PROJECT_ROOT" ] || PROJECT_ROOT="$(niblet_project_root "$PWD")"
+[ -d "$PROJECT_ROOT" ] || { printf 'not a directory: %s\n' "$PROJECT_ROOT" >&2; exit 66; }
+
+niblet_load_config "$PROJECT_ROOT"
+
+STORE="$(niblet_store "$PROJECT_ROOT")"
+CODE_WALKER_DIR="$STORE/code_walker_queue"
+
+echo "== niblet-maintain: $PROJECT_ROOT (dry-run=$DRY_RUN) =="
+
+# 1. Ratchet loop — promote underperforming artifacts based on metrics.
+echo ""
+echo "-- ratchet --"
+if [ "$DRY_RUN" = "1" ]; then
+  "$SCRIPT_DIR/niblet-ratchet" --project-root "$PROJECT_ROOT" --dry-run || true
+else
+  "$SCRIPT_DIR/niblet-ratchet" --project-root "$PROJECT_ROOT" || true
+fi
+
+# 2. Skill gardener — auto-promote eligible low-risk proposals.
+echo ""
+echo "-- gardener --"
+if [ "$DRY_RUN" = "1" ]; then
+  NIBLET_AUTO_PROMOTE=0 "$SCRIPT_DIR/niblet-skill-gardener" --project-root "$PROJECT_ROOT" --dry-run || true
+else
+  "$SCRIPT_DIR/niblet-skill-gardener" --project-root "$PROJECT_ROOT" || true
+fi
+
+# 3. Queue report — agent-required checkpoints.
+echo ""
+echo "-- agent-required queues --"
+report_one() {
+  local label="$1" dir="$2" pattern="$3"
+  printf '%s: ' "$label"
+  if [ -d "$dir" ]; then
+    local count
+    count="$(find "$dir" -maxdepth 1 -type f -name "$pattern" 2>/dev/null | wc -l | tr -d ' ')"
+    printf '%s\n' "$count"
+  else
+    printf '0\n'
+  fi
+}
+report_one "deep"        "$STORE/pending_deep"   "*.queue"
+report_one "audit"       "$STORE/audit_queue"    "*.audit"
+report_one "distill"     "$STORE/distill_queue"  "*.distill"
+report_one "code-walker" "$CODE_WALKER_DIR"      "*.queue"
+
+echo ""
+echo "Maintenance pass complete."

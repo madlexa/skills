@@ -86,6 +86,7 @@ is_urgent_feedback() {
 DISTILL_QUEUE_DIR="$STORE/distill_queue"
 DISTILL_QUEUED_FLAG="$SESSION_DIR/DISTILL_QUEUED"
 AUDIT_QUEUE_DIR="$STORE/audit_queue"
+CODE_WALKER_QUEUE_DIR="$STORE/code_walker_queue"
 
 KB_DIR="$(niblet_artifact_dir kb       project "$PROJECT_ROOT")"
 MEM_DIR="$(niblet_artifact_dir memory   project "$PROJECT_ROOT")"
@@ -146,7 +147,7 @@ _sweep_stale_claims() {
   case "$hours" in *[!0-9]*) hours=24 ;; esac
   mins=$((hours * 60))
   local d
-  for d in "$QUEUE_DIR" "$DISTILL_QUEUE_DIR" "$AUDIT_QUEUE_DIR"; do
+  for d in "$QUEUE_DIR" "$DISTILL_QUEUE_DIR" "$AUDIT_QUEUE_DIR" "$CODE_WALKER_QUEUE_DIR"; do
     [ -d "$d" ] && find "$d" -maxdepth 1 -name '*.claimed-*' -type f -mmin "+$mins" -delete 2>/dev/null
   done
 }
@@ -194,6 +195,20 @@ if [ -d "$AUDIT_QUEUE_DIR" ]; then
     AUDIT_CLAIMED="${AUDIT_CAND%.audit}.claimed-$SESSION"
     if mv -n "$AUDIT_CAND" "$AUDIT_CLAIMED" 2>/dev/null && [ -f "$AUDIT_CLAIMED" ]; then
       AUDIT_FILE="$AUDIT_CLAIMED"
+    fi
+  fi
+fi
+
+# Atomically claim the oldest code-walker queue entry.
+CODE_WALKER_FILE=""
+CODE_WALKER_SIZE=0
+if [ -d "$CODE_WALKER_QUEUE_DIR" ]; then
+  CODE_WALKER_SIZE="$(ls -1 "$CODE_WALKER_QUEUE_DIR"/*.queue 2>/dev/null | wc -l | tr -d ' ')"
+  CODE_WALKER_CAND="$(ls -1 "$CODE_WALKER_QUEUE_DIR"/*.queue 2>/dev/null | sort | head -n1)"
+  if [ -n "$CODE_WALKER_CAND" ] && [ -f "$CODE_WALKER_CAND" ]; then
+    CODE_WALKER_CLAIMED="${CODE_WALKER_CAND%.queue}.claimed-$SESSION"
+    if mv -n "$CODE_WALKER_CAND" "$CODE_WALKER_CLAIMED" 2>/dev/null && [ -f "$CODE_WALKER_CLAIMED" ]; then
+      CODE_WALKER_FILE="$CODE_WALKER_CLAIMED"
     fi
   fi
 fi
@@ -547,26 +562,98 @@ $(proposal_status_line)
 EOF
 }
 
+emit_code_walker() {
+  local q_component
+  q_component="$(grep -E '^component=' "$CODE_WALKER_FILE" 2>/dev/null | head -n1 | cut -d= -f2-)"
+  [ -n "$q_component" ] || q_component="(unknown)"
+
+  cat <<EOF
+NIBLET CHECKPOINT (code-walker) — queue size $CODE_WALKER_SIZE, processing $(basename "$CODE_WALKER_FILE")
+
+A component has been read or edited enough times that niblet wants to distill
+a durable KB map from it. This is the KB-as-side-effect path: knowledge is
+created while the agent reads files for its real tasks.
+
+Background bookkeeping — NON-BLOCKING. FIRST fully handle the user's request,
+THEN (only if it doesn't delay them) process this. If you're mid-task or unsure,
+just \`rm $CODE_WALKER_FILE\` and skip. Do it QUIETLY: never paste raw JSON action
+bodies into your reply, and if the result is only NOTHING, silently
+\`rm $CODE_WALKER_FILE\` without writing a NOTHING file or narrating it.
+
+When you do process it:
+
+1. Use the Task / Agent tool with subagent_type=general-purpose and the
+   following prompt verbatim:
+
+   ---
+   You are the niblet-code-walker sub-agent. Walk the project tree and emit or
+   update component-level KB entries.
+
+   Inputs:
+     - Project root:      $PROJECT_ROOT
+     - KB directory:      $KB_DIR
+     - Focus component:   $q_component (walk this component first, then others if time permits)
+
+   Follow the instructions in $PROJECT_ROOT/plugins/niblet/agents/niblet-code-walker.md.
+
+   Output STRICTLY one JSON object per line between the sentinels.
+   No prose outside the sentinels.
+
+       <<<NIBLET ACTIONS BEGIN>>>
+       {"action":"<ACTION>", ...fields...}
+       <<<NIBLET ACTIONS END>>>
+
+   Allowed actions (all values are JSON strings; newlines in content as \\\n):
+     - {"action":"ADD_KB_ENTRY","scope":"project","topic":"<slug>.md","content":"<md>"}
+     - {"action":"MERGE_KB_ENTRY","scope":"project","topic":"<slug>.md","content":"<md>","reason":"<why>"}
+     - {"action":"UPDATE_KB_ENTRY","scope":"project","topic":"<slug>.md","content":"<md>","reason":"<why>"}
+     - {"action":"OPEN_QUESTION","scope":"project","content":"<question>"}
+     - {"action":"NOTHING","reason":"<one sentence>"}
+
+   Slugs: 1..64 chars, [a-z0-9][a-z0-9._-]*. No slashes, no "..".
+   ---
+
+2. For each emitted action, stage it via Write to a file under $STORE/inbox/
+   and pipe that file into niblet-apply — do NOT \`echo '<json>' | …\`:
+
+       Write file_path=$STORE/inbox/<random>.json   (the JSON object)
+       niblet-apply --project-root "$PROJECT_ROOT" < $STORE/inbox/<random>.json
+
+3. Delete the processed queue entry:
+       rm $CODE_WALKER_FILE
+
+4. Only if something was actually written or proposed, mention it in one short
+   line. If everything was NOTHING, say nothing — just return to the user's request.
+$(proposal_status_line)
+EOF
+}
+
 # Drain order:
 #   1. URGENT FAST — user correction / negative feedback / interruption signal.
-#   2. DEEP > AUDIT > DISTILL > FAST (normal background order).
+#   2. DEEP > AUDIT > DISTILL > CODE_WALKER > FAST (normal background order).
 # When a higher-priority entry wins, release any claimed lower-priority entries
 # back to their queues so a future session can pick them up (prevents stranding).
 if [ "$URGENT_FAST" = "1" ] && [ -f "$PENDING_FAST" ]; then
   # User feedback is time-sensitive; capture it before any background work.
-  [ -n "$QUEUE_FILE" ]   && [ -f "$QUEUE_FILE" ]   && mv "$QUEUE_FILE"   "$CANDIDATE"   2>/dev/null || true
-  [ -n "$DISTILL_FILE" ] && [ -f "$DISTILL_FILE" ] && mv "$DISTILL_FILE" "$DISTILL_CAND" 2>/dev/null || true
-  [ -n "$AUDIT_FILE"   ] && [ -f "$AUDIT_FILE" ]   && mv "$AUDIT_FILE"   "$AUDIT_CAND"   2>/dev/null || true
+  [ -n "$QUEUE_FILE" ]       && [ -f "$QUEUE_FILE" ]       && mv "$QUEUE_FILE"       "$CANDIDATE"           2>/dev/null || true
+  [ -n "$DISTILL_FILE" ]     && [ -f "$DISTILL_FILE" ]     && mv "$DISTILL_FILE"     "$DISTILL_CAND"         2>/dev/null || true
+  [ -n "$AUDIT_FILE"   ]     && [ -f "$AUDIT_FILE" ]       && mv "$AUDIT_FILE"       "$AUDIT_CAND"           2>/dev/null || true
+  [ -n "$CODE_WALKER_FILE" ] && [ -f "$CODE_WALKER_FILE" ] && mv "$CODE_WALKER_FILE" "$CODE_WALKER_CAND"     2>/dev/null || true
   emit_fast 1
 elif [ -n "$QUEUE_FILE" ] && [ -f "$QUEUE_FILE" ]; then
-  [ -n "$DISTILL_FILE" ] && [ -f "$DISTILL_FILE" ] && mv "$DISTILL_FILE" "$DISTILL_CAND" 2>/dev/null || true
-  [ -n "$AUDIT_FILE"   ] && [ -f "$AUDIT_FILE"   ] && mv "$AUDIT_FILE"   "$AUDIT_CAND"   2>/dev/null || true
+  [ -n "$DISTILL_FILE" ]     && [ -f "$DISTILL_FILE" ]     && mv "$DISTILL_FILE"     "$DISTILL_CAND"         2>/dev/null || true
+  [ -n "$AUDIT_FILE"   ]     && [ -f "$AUDIT_FILE"   ]     && mv "$AUDIT_FILE"       "$AUDIT_CAND"           2>/dev/null || true
+  [ -n "$CODE_WALKER_FILE" ] && [ -f "$CODE_WALKER_FILE" ] && mv "$CODE_WALKER_FILE" "$CODE_WALKER_CAND"     2>/dev/null || true
   emit_deep
 elif [ -n "$AUDIT_FILE" ] && [ -f "$AUDIT_FILE" ]; then
-  [ -n "$DISTILL_FILE" ] && [ -f "$DISTILL_FILE" ] && mv "$DISTILL_FILE" "$DISTILL_CAND" 2>/dev/null || true
+  [ -n "$DISTILL_FILE" ]     && [ -f "$DISTILL_FILE" ]     && mv "$DISTILL_FILE"     "$DISTILL_CAND"         2>/dev/null || true
+  [ -n "$CODE_WALKER_FILE" ] && [ -f "$CODE_WALKER_FILE" ] && mv "$CODE_WALKER_FILE" "$CODE_WALKER_CAND"     2>/dev/null || true
   emit_audit
 elif [ -n "$DISTILL_FILE" ] && [ -f "$DISTILL_FILE" ]; then
+  [ -n "$CODE_WALKER_FILE" ] && [ -f "$CODE_WALKER_FILE" ] && mv "$CODE_WALKER_FILE" "$CODE_WALKER_CAND"     2>/dev/null || true
   emit_distill
+elif [ -n "$CODE_WALKER_FILE" ] && [ -f "$CODE_WALKER_FILE" ]; then
+  emit_code_walker
 elif [ -f "$PENDING_FAST" ]; then
   emit_fast
 fi
